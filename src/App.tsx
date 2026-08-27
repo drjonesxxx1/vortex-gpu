@@ -418,7 +418,7 @@ function Dashboard({
         <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-5 py-3">
           <Logo />
           <div className="flex items-center gap-2 sm:gap-4">
-            <div className="hidden text-right sm:block">
+            <div className="text-right">
               <div className="text-[10px] uppercase tracking-widest text-zinc-500">Balance</div>
               <div className="font-mono text-sm font-bold text-amber-300">
                 {unlimited ? '∞' : fmtBalance(user.balance_minutes)}
@@ -777,7 +777,8 @@ function SessionCard({
             </span>
           ) : (
             <span className={cx(BTN_BASE, 'flex-1 bg-white/5 py-2.5 text-sm text-zinc-500')}>
-              <Power className="w-4 h-4" aria-hidden="true" /> {s.state === 'failed' ? 'Failed to start' : 'Stopped'}
+              <Power className="w-4 h-4" aria-hidden="true" />{' '}
+              {s.state === 'failed' ? 'Failed to start' : s.state === 'stopping' ? 'Stopping…' : 'Stopped'}
             </span>
           )}
           {isActive && (
@@ -831,6 +832,13 @@ function VmCard({
       {vm.state === 'provisioning' && (
         <p className="mt-4 flex items-center gap-2 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-xs text-amber-200" aria-live="polite">
           <Spinner className="w-3.5 h-3.5" /> Cloning the template and booting — this takes a couple of minutes.
+        </p>
+      )}
+      {(vm.state === 'stopping' || vm.state === 'stopped') && (
+        <p className="mt-4 flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-zinc-400">
+          {vm.state === 'stopping'
+            ? <><Spinner className="w-3.5 h-3.5" /> Shutting down — this machine has stopped billing.</>
+            : <><Power className="w-3.5 h-3.5" aria-hidden="true" /> Stopped. Deploy a new machine above when you need one.</>}
         </p>
       )}
       {vm.state === 'failed' && (
