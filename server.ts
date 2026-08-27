@@ -379,6 +379,35 @@ function clientIp(req: express.Request): string {
   return raw.replace(/^::ffff:/, "");
 }
 
+// ---- Rate limiting (in-process fixed window; no new dependencies) ----
+// NOTE on keys: clientIp() trusts X-Forwarded-For, which any client can forge
+// unless a reverse proxy overwrites it. IP-keyed limits below are therefore
+// best-effort throttles for naive abuse. The limits that actually matter for
+// credential stuffing and invoice spam are keyed by username / user id, which
+// a caller cannot rotate.
+type RateBucket = { count: number; resetAt: number };
+const RATE_BUCKETS = new Map<string, RateBucket>();
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of RATE_BUCKETS) if (now >= b.resetAt) RATE_BUCKETS.delete(k);
+}, 60_000);
+
+function rateLimit(name: string, limit: number, windowMs: number, keyFn?: (req: express.Request) => string): express.RequestHandler {
+  return (req, res, next) => {
+    const key = `${name}:${keyFn ? keyFn(req) : clientIp(req)}`;
+    const now = Date.now();
+    let b = RATE_BUCKETS.get(key);
+    if (!b || now >= b.resetAt) { b = { count: 0, resetAt: now + windowMs }; RATE_BUCKETS.set(key, b); }
+    b.count++;
+    if (b.count > limit) {
+      const retryAfterSec = Math.max(1, Math.ceil((b.resetAt - now) / 1000));
+      res.setHeader("Retry-After", String(retryAfterSec));
+      return res.status(429).json({ error: "too many requests — slow down", retryAfterSec });
+    }
+    next();
+  };
+}
+
 // ---- BTCPay client (self-signed LAN) ----
 function btcpay(method: string, apiPath: string, body?: unknown): Promise<{ status: number; data: any }> {
   return new Promise((resolve) => {
@@ -428,7 +457,9 @@ async function startServer() {
     return { id: u.id, username: u.username, balance_minutes: u.balance_minutes, unlimited: !!u.unlimited, free_machines: FREE_MACHINES, max_machines: MAX_VMS_PER_USER };
   }
 
-  app.post("/api/auth/register", (req, res) => {
+  // Account farming is not just spam here: every new account carries a FREE
+  // machine slot, so unlimited registration is unlimited free GPU time.
+  app.post("/api/auth/register", rateLimit("register", 10, 60 * 60_000), (req, res) => {
     const username = str(req.body?.username, "").slice(0, 32).trim();
     const password = str(req.body?.password, "");
     if (!username) return res.status(400).json({ error: "username required" });
@@ -444,7 +475,13 @@ async function startServer() {
     res.json({ token: issueToken(id), user: publicUser(user) });
   });
 
-  app.post("/api/auth/login", (req, res) => {
+  // Two limiters: one best-effort per source IP, one per targeted username that
+  // a distributed attacker cannot rotate around. Both also bound the cost of
+  // scryptSync, which blocks the single-threaded event loop.
+  app.post("/api/auth/login",
+    rateLimit("login-ip", 20, 5 * 60_000),
+    rateLimit("login-user", 10, 15 * 60_000, (req) => str(req.body?.username, "").slice(0, 64).trim().toLowerCase()),
+    (req, res) => {
     const username = str(req.body?.username, "").slice(0, 64).trim();
     const password = str(req.body?.password, "");
     // Bound scrypt work before doing any: an unbounded password is a cheap way to
@@ -536,7 +573,9 @@ async function startServer() {
   });
 
   // ===== BTCPAY =====
-  app.post("/api/btcpay/create-invoice", async (req, res) => {
+  app.post("/api/btcpay/create-invoice",
+    rateLimit("invoice", 20, 60 * 60_000, (req) => resolveToken(tokenFromReq(req)) || clientIp(req)),
+    async (req, res) => {
     const { usdAmount } = req.body || {};
     const user = userFromReq(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
