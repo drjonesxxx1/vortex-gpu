@@ -48,6 +48,7 @@ const WEBHOOK_SECRET = process.env.BTCPAY_WEBHOOK_SECRET || "";
 if (!WEBHOOK_SECRET) throw new Error("BTCPAY_WEBHOOK_SECRET is required; refusing to start with an unsigned-webhook fallback");
 const OWNER_SEED_PASSWORD = process.env.OWNER_SEED_PASSWORD || "";
 const PRICE_USD_PER_HOUR = 1.0;
+const MAX_INVOICE_CENTS = 1_000_000; // $10,000 ceiling on a single top-up
 const MAX_VMS_PER_USER = 3;
 const FREE_MACHINES = Number(process.env.FREE_MACHINES) || 1; // 1st machine free, 2nd+ billed
 
@@ -518,8 +519,15 @@ async function startServer() {
     const { usdAmount } = req.body || {};
     const user = userFromReq(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
-    const amountUsd = Math.max(1, Number(usdAmount) || 5);
-    const minutes = Math.round(amountUsd / PRICE_USD_PER_HOUR * 60);
+    // Round to whole cents FIRST, then derive minutes from the exact figure that
+    // is charged. Deriving minutes from the unrounded request let e.g. 5.004 be
+    // billed as $5.00 while crediting for $5.004 of time, and a non-finite
+    // usdAmount produced a non-integer `minutes` bound for an INTEGER column.
+    const requested = Number(usdAmount);
+    const cents = Math.min(MAX_INVOICE_CENTS, Math.max(100, Math.round((Number.isFinite(requested) && requested > 0 ? requested : 5) * 100)));
+    const amountUsd = cents / 100;
+    const minutes = Math.floor((cents * 60) / (PRICE_USD_PER_HOUR * 100));
+    if (!Number.isSafeInteger(minutes) || minutes <= 0) return res.status(400).json({ error: "invalid amount" });
     if (!BTCPAY_API_KEY || !BTCPAY_STORE_ID) return res.status(500).json({ error: "BTCPay not configured" });
 
     const { status, data } = await btcpay("POST", `/api/v1/stores/${BTCPAY_STORE_ID}/invoices`, {
@@ -527,27 +535,49 @@ async function startServer() {
     });
     if (status < 200 || status >= 300) return res.status(502).json({ error: data?.message || "BTCPay failed" });
 
+    // Without a BTCPay invoice id the webhook can never match this row, so the
+    // customer would pay and never be credited. Fail loudly instead.
+    const btcpayInvoiceId = str(data?.id, "");
+    if (!btcpayInvoiceId) return res.status(502).json({ error: "BTCPay returned no invoice id" });
+
     const invId = crypto.randomBytes(8).toString("hex");
-    const checkoutLink = (data.checkoutLink || "").replace(BTCPAY_URL, BTCPAY_PUBLIC);
+    const checkoutLink = str(data?.checkoutLink, "").replace(BTCPAY_URL, BTCPAY_PUBLIC);
     q("INSERT INTO invoices (id,user_id,amount_usd,minutes,btcpay_invoice_id,checkout_link,status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-      invId, user.id, amountUsd, minutes, data.id, checkoutLink, "pending", Date.now());
-    res.json({ invoiceId: invId, btcpayInvoiceId: data.id, amountUsd, minutesAdded: minutes, checkoutLink, status: "pending" });
+      invId, user.id, amountUsd, minutes, btcpayInvoiceId, checkoutLink, "pending", Date.now());
+    res.json({ invoiceId: invId, btcpayInvoiceId, amountUsd, minutesAdded: minutes, checkoutLink, status: "pending" });
   });
 
   app.post("/api/btcpay/webhook", (req, res) => {
-    const sig = req.headers["btcpay-sig"] as string;
+    const sig = String(req.headers["btcpay-sig"] || "");
     if (!sig) return res.status(401).json({ error: "missing signature" });
-    const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
-    const expected = crypto.createHmac("sha256", WEBHOOK_SECRET).update(raw).digest("hex");
-    if (sig !== `sha256=${expected}`) return res.status(401).json({ error: "bad signature" });
+    // The HMAC must cover the exact bytes BTCPay signed. If express.raw did not
+    // run (i.e. not application/json), there is no authentic body to verify —
+    // re-serialising a parsed object would never reproduce the signed bytes, so
+    // that old fallback path could only ever fail. Reject it explicitly.
+    if (!Buffer.isBuffer(req.body)) return res.status(400).json({ error: "expected raw body" });
+    const expected = `sha256=${crypto.createHmac("sha256", WEBHOOK_SECRET).update(req.body).digest("hex")}`;
+    const sigBuf = Buffer.from(sig, "utf8");
+    const expBuf = Buffer.from(expected, "utf8");
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) return res.status(401).json({ error: "bad signature" });
     let payload: any = {};
-    try { payload = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString("utf8") : JSON.stringify(req.body)); } catch { return res.status(400).json({ error: "invalid json" }); }
+    try { payload = JSON.parse(req.body.toString("utf8")); } catch { return res.status(400).json({ error: "invalid json" }); }
 
-    if (payload.type === "InvoiceSettled" || payload.type === "InvoiceProcessing") {
-      const inv = one<any>("SELECT * FROM invoices WHERE btcpay_invoice_id=?", payload.invoiceId);
+    const invoiceId = str(payload?.invoiceId, "");
+    if ((payload?.type === "InvoiceSettled" || payload?.type === "InvoiceProcessing") && invoiceId) {
+      const inv = one<any>("SELECT * FROM invoices WHERE btcpay_invoice_id=?", invoiceId);
+      // Replay guard: the status flip and the credit happen in one synchronous
+      // block (node:sqlite is sync, the loop is single-threaded), so a replayed
+      // or duplicated delivery can never credit the same invoice twice.
       if (inv && inv.status !== "settled") {
         q("UPDATE invoices SET status='settled', settled_at=? WHERE id=?", Date.now(), inv.id);
-        q("UPDATE users SET balance_minutes = balance_minutes + ? WHERE id=?", inv.minutes, inv.user_id);
+        // Credit only a sane stored figure — never a NaN/float/negative that
+        // would corrupt balance_minutes.
+        const minutes = Number(inv.minutes);
+        if (Number.isSafeInteger(minutes) && minutes > 0) {
+          q("UPDATE users SET balance_minutes = balance_minutes + ? WHERE id=?", minutes, inv.user_id);
+        } else {
+          console.error(`[btcpay] invoice ${inv.id} has non-creditable minutes=${inv.minutes}; settled without credit`);
+        }
       }
     }
     res.json({ received: true });
