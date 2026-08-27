@@ -1,19 +1,37 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  Monitor, Cpu, Plus, Power, Clock, Shield, Terminal, Zap,
-  Bitcoin, Laptop, Server, KeyRound, Sparkles, LogOut, X, ExternalLink, Copy, Globe, UserPlus, LogIn,
-  ArrowRight, CheckCircle2, Rocket, Lock, Gauge, Loader2,
+  Activity, AlertTriangle, ArrowRight, Bitcoin, CheckCircle2, ChevronRight, Clock,
+  Copy, Cpu, ExternalLink, Eye, EyeOff, Globe, KeyRound, Laptop, Loader2, Lock,
+  LogIn, LogOut, Menu, Monitor, Power, Rocket, Server, Shield, Terminal,
+  UserPlus, Wallet, X, Zap,
 } from 'lucide-react';
-import { Cyber3DCanvas } from './components/Cyber3DCanvas';
 import './index.css';
 
+/** three.js is ~460 kB of the bundle and the hero renders fine without it for a
+ *  beat, so it is code-split out of the critical path. */
+const Cyber3DCanvas = lazy(() =>
+  import('./components/Cyber3DCanvas').then((m) => ({ default: m.Cyber3DCanvas })),
+);
+
 /**
- * VortexGPU — rent-a-PC storefront.
- * Unified products: Ubuntu GPU Session (in-browser 4080), Windows RDP, Linux SSH.
- * Pricing: $1/hr. First machine FREE, 2nd & 3rd billed. Bitcoin via BTCPay.
- * Token auth: register / login / logout — everyone gets their own account.
+ * VortexGPU — anonymous, Bitcoin-settled GPU rental.
+ *
+ * Everything rendered here is backed by a real endpoint in server.ts:
+ *   GET  /api/health                 public status + pricing constants
+ *   POST /api/auth/register|login    { username, password } -> { token, user }
+ *   GET  /api/me                     user, vms[], sessions[], limits, gpu sku
+ *   POST /api/session/spawn          Ubuntu GPU session (in-browser noVNC)
+ *   POST /api/vms/provision          Windows RDP / Linux SSH VM
+ *   POST /api/session/destroy | /api/vms/destroy
+ *   POST /api/btcpay/create-invoice  { usdAmount } -> { checkoutLink, ... }
+ *
+ * Billing model as implemented server-side: the first FREE_MACHINES concurrent
+ * machines cost nothing; each additional running machine burns one balance
+ * minute per wall-clock minute, and hitting zero auto-stops everything.
  */
+
+/* ------------------------------------------------------------------ types */
 
 interface ApiVm {
   id: string; vm_id: number; os: string; sku: string; state: string;
@@ -26,12 +44,21 @@ interface ApiSession {
   password: string; resolution: string; proxy: string | null; state: string; created_at: number;
 }
 
-interface User { id: string; username: string; balance_minutes: number; unlimited?: boolean; }
+interface User { id: string; username: string; balance_minutes: number; unlimited?: boolean }
 
-// One-click noVNC desktop URL. The container serves the full noVNC client at
-// /static/vnc.html (verified — no /vnc.html exists at the root); host/port/
-// encrypt default to window.location in noVNC, so only `path` must carry the
-// gateway prefix, and `password` skips the manual VNC password prompt.
+interface Health {
+  gpuNodesOnline: number; gpuNodesTotal: number; gpuSku: string;
+  priceUsdPerHour: number; maxVmsPerUser: number; freeMachines: number;
+}
+
+interface Auth { token: string; user: User }
+
+/* ---------------------------------------------------------------- helpers */
+
+const AUTH_KEY = 'vortex_auth';
+
+/** noVNC lives at /static/vnc.html inside the container; only `path` needs the
+ *  gateway prefix since host/port/encrypt default to window.location. */
 function desktopUrlFor(s: ApiSession): string {
   const params = new URLSearchParams({
     autoconnect: 'true',
@@ -48,623 +75,1553 @@ function fmtUptime(createdAt: number, now: number): string {
   return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${ss}s` : `${ss}s`;
 }
 
-function App() {
-  const [auth, setAuth] = useState<{ token: string; user: User } | null>(null);
-  const [vms, setVms] = useState<ApiVm[]>([]);
-  const [sessions, setSessions] = useState<ApiSession[]>([]);
-  const [gpuSku, setGpuSku] = useState('NVIDIA GeForce RTX 4080 SUPER 16GB');
-  const [price, setPrice] = useState(1);
-  const [maxMachines, setMaxMachines] = useState(3);
-  const [freeMachines, setFreeMachines] = useState(1);
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [view, setView] = useState<'landing' | 'auth'>('landing');
+function fmtBalance(minutes: number): string {
+  const m = Math.max(0, Math.floor(minutes));
+  const h = Math.floor(m / 60);
+  return h > 0 ? `${h}h ${m % 60}m` : `${m}m`;
+}
 
-  useEffect(() => {
-    const raw = localStorage.getItem('vortex_auth');
-    if (raw) { try { const a = JSON.parse(raw); if (a?.token) setAuth(a); } catch {} }
-  }, []);
+/** Server errors are `{ error }` JSON, but a proxy hiccup can return HTML. */
+async function readError(r: Response, fallback: string): Promise<string> {
+  try {
+    const d = await r.json();
+    if (d && typeof d.error === 'string' && d.error) return d.error;
+  } catch { /* not JSON */ }
+  return `${fallback} (HTTP ${r.status})`;
+}
 
-  const refresh = useCallback(async () => {
-    if (!auth) return;
-    try {
-      const r = await fetch('/api/me', { headers: { Authorization: `Bearer ${auth.token}` } });
-      if (r.status === 401) { setAuth(null); localStorage.removeItem('vortex_auth'); return; }
-      if (r.ok) {
-        const d = await r.json();
-        setVms(d.vms || []);
-        setSessions(d.sessions || []);
-        setGpuSku(d.gpu_sku || gpuSku);
-        setPrice(d.price_per_hour || 1);
-        setMaxMachines(d.max_machines === -1 ? 999 : d.max_machines || 3);
-        setFreeMachines(d.free_machines || 1);
-        setAuth((a) => (a ? { ...a, user: { ...a.user, ...d.user } } : a));
-      }
-    } catch (e) { console.error(e); }
-  }, [auth?.token]);
+const cx = (...parts: Array<string | false | null | undefined>) => parts.filter(Boolean).join(' ');
 
-  // 1s clock for live uptime counters on session cards.
-  const [nowTs, setNowTs] = useState(Date.now());
-  useEffect(() => {
-    const t = setInterval(() => setNowTs(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
+/* Shared class recipes — one place to keep buttons consistent. */
+const BTN_BASE =
+  'inline-flex items-center justify-center gap-2 rounded-xl font-semibold transition-colors ' +
+  'disabled:opacity-45 disabled:cursor-not-allowed select-none';
+const BTN_PRIMARY = `${BTN_BASE} bg-cyan-400 text-ink-950 hover:bg-cyan-300 disabled:hover:bg-cyan-400`;
+const BTN_AMBER = `${BTN_BASE} bg-amber-400 text-ink-950 hover:bg-amber-300 disabled:hover:bg-amber-400`;
+const BTN_GHOST = `${BTN_BASE} border border-white/15 text-zinc-200 hover:border-cyan-400/50 hover:text-white`;
 
-  // Poll every 4s so provisioning sessions flip 'Open Desktop' to active live.
-  useEffect(() => {
-    if (!auth) return;
-    refresh();
-    const t = setInterval(refresh, 4000);
-    return () => clearInterval(t);
-  }, [auth, refresh]);
+/* ------------------------------------------------------------ small parts */
 
-  if (!auth) {
-    return view === 'landing'
-      ? <LandingPage onLaunch={() => setView('auth')} />
-      : <AuthGate onAuthed={setAuth} onBack={() => setView('landing')} />;
-  }
-
-  const user = auth.user;
-  const hrs = Math.floor(user.balance_minutes / 60);
-  const mins = user.balance_minutes % 60;
-  const activeCount = [...vms, ...sessions].filter((r: any) => r.state === 'running' || r.state === 'provisioning').length;
-  const atCap = !user.unlimited && activeCount >= maxMachines;
-
-  const api = (path: string, body?: any) => fetch(path, {
-    method: body ? 'POST' : 'GET',
-    headers: { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  const deployVm = async (os: 'windows' | 'linux') => {
-    setLoading(true); setError('');
-    try {
-      const r = await api('/api/vms/provision', { os });
-      const d = await r.json();
-      if (r.ok) refresh(); else setError(d.error || 'deploy failed');
-    } catch { setError('network error'); } finally { setLoading(false); }
-  };
-
-  const spawnSession = async () => {
-    setLoading(true); setError('');
-    try {
-      const r = await api('/api/session/spawn', { resolution: '1440x900' });
-      const d = await r.json();
-      if (r.ok) refresh(); else setError(d.error || 'spawn failed');
-    } catch { setError('network error'); } finally { setLoading(false); }
-  };
-
-  const destroyVm = async (vmId: string) => { await api('/api/vms/destroy', { vmId }); refresh(); };
-  const destroySession = async (sessionId: string) => { await api('/api/session/destroy', { sessionId }); refresh(); };
-  const logout = () => { setAuth(null); localStorage.removeItem('vortex_auth'); };
-
+function Logo({ className = 'text-lg' }: { className?: string }) {
   return (
-    <div className="min-h-screen bg-[#05070d] text-zinc-100 font-sans">
-      <header className="border-b border-zinc-800/70 bg-zinc-950/60 backdrop-blur sticky top-0 z-40">
-        <div className="max-w-6xl mx-auto px-5 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-2 font-black tracking-tight text-white text-lg">
-            <Cpu className="w-5 h-5 text-cyan-400" /> VORTEX<span className="text-cyan-400">GPU</span>
-          </div>
-          <div className="flex items-center gap-4">
-            <div className="text-right">
-              <div className="text-[11px] text-zinc-500 uppercase tracking-wide">Balance</div>
-              <div className="text-sm font-bold text-amber-300">{hrs}h {mins}m</div>
-            </div>
-            <TopUpButton token={auth.token} onAdded={() => refresh()} />
-            <div className="text-right">
-              <div className="text-cyan-300 font-bold text-sm">@{user.username}{user.unlimited && <span className="text-amber-400" title="Unlimited machines"> ∞</span>}</div>
-              <div className="text-[10px] text-zinc-500">{user.unlimited ? '∞ machines' : `${activeCount}/${maxMachines} machines · ${freeMachines} free`}</div>
-            </div>
-            <button onClick={logout} className="p-2 text-zinc-500 hover:text-white rounded-lg border border-zinc-800" title="Logout"><LogOut className="w-4 h-4" /></button>
-          </div>
-        </div>
-      </header>
+    <span className={cx('inline-flex items-center gap-2 font-extrabold tracking-tight text-white', className)}>
+      <Cpu className="w-5 h-5 text-cyan-400" aria-hidden="true" />
+      <span>
+        VORTEX<span className="text-cyan-400">GPU</span>
+      </span>
+    </span>
+  );
+}
 
-      <main className="max-w-6xl mx-auto px-5 py-6 space-y-6">
-        {error && (
-          <div className="p-3 bg-red-950/60 border border-red-500/40 rounded-xl text-sm text-red-300 flex justify-between items-center">
-            <span>{error}</span>
-            <button onClick={() => setError('')} className="text-red-400 font-bold"><X className="w-4 h-4" /></button>
-          </div>
-        )}
+function Spinner({ className = 'w-4 h-4' }: { className?: string }) {
+  return <Loader2 className={cx(className, 'animate-spin')} aria-hidden="true" />;
+}
 
-        {/* Products */}
-        <div>
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="font-bold text-lg">Products</h2>
-            <span className="text-xs text-zinc-500">{gpuSku} · ${price}/hr · first machine free</span>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <ProductCard
-              icon={<Terminal className="w-7 h-7 text-emerald-400" />}
-              name="Ubuntu GPU Session"
-              tag="In-browser · 4080 SUPER"
-              desc="Full Ubuntu desktop in your browser with the 4080 attached. Install anything, run any GPU job."
-              cta="⚡ Spawn Session"
-              onClick={spawnSession}
-              accent="emerald"
-            />
-            <ProductCard
-              icon={<Laptop className="w-7 h-7 text-cyan-400" />}
-              name="Windows 10"
-              tag="RDP · full desktop"
-              desc="Real Windows 10 VM via RDP. Games, CUDA, GUI apps."
-              cta="Deploy Windows"
-              onClick={() => deployVm('windows')}
-              accent="cyan"
-            />
-            <ProductCard
-              icon={<Server className="w-7 h-7 text-purple-400" />}
-              name="Linux"
-              tag="SSH · headless compute"
-              desc="Debian VM over SSH. Headless compute, docker, servers."
-              cta="Deploy Linux"
-              onClick={() => deployVm('linux')}
-              accent="purple"
-            />
-          </div>
-          {atCap && <p className="mt-2 text-[11px] text-amber-400">Machine limit reached ({maxMachines} max). Stop one to deploy another.</p>}
-        </div>
-
-        {/* Your resources */}
-        <div>
-          <h2 className="font-bold text-lg mb-3">Your Resources</h2>
-          {(vms.length === 0 && sessions.length === 0) ? (
-            <div className="text-center py-16 border border-dashed border-zinc-800 rounded-2xl">
-              <Monitor className="w-12 h-12 mx-auto text-zinc-700 mb-3" />
-              <p className="text-zinc-500">Nothing running yet. Your first machine is free — spawn a session or deploy a VM above.</p>
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {sessions.map((s) => {
-                const isRunning = s.state === 'running';
-                const isProvisioning = s.state === 'provisioning';
-                const isActive = isRunning || isProvisioning;
-                return (
-                <div key={s.id} className={`bg-zinc-900/40 border rounded-2xl p-5 ${isRunning ? 'border-emerald-500/50 shadow-lg shadow-emerald-500/5' : isProvisioning ? 'border-amber-500/30' : 'border-zinc-800'}`}>
-                  <div className="flex items-start justify-between">
-                    <div className="flex items-center gap-2">
-                      <Terminal className="w-5 h-5 text-emerald-400" />
-                      <div>
-                        <div className="font-bold">Ubuntu Session <span className="text-[10px] text-zinc-500">{s.instance_id}</span></div>
-                        <div className="text-[11px] text-zinc-500">{gpuSku} · node {s.node_hostname}:{s.port}</div>
-                      </div>
-                    </div>
-                    <StateBadge state={s.state} />
-                  </div>
-                  <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px]">
-                    <div className="flex items-center gap-1.5">
-                      <Monitor className="w-3.5 h-3.5 text-emerald-400" />
-                      <span className="text-zinc-500">Resolution</span>
-                      <span className="text-zinc-200 font-mono">{s.resolution}</span>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <Clock className="w-3.5 h-3.5 text-emerald-400" />
-                      <span className="text-zinc-500">Uptime</span>
-                      <span className="text-zinc-200 font-mono">{isActive ? fmtUptime(s.created_at, nowTs) : '—'}</span>
-                    </div>
-                    <div className="col-span-2 flex items-center gap-1.5">
-                      <Globe className="w-3.5 h-3.5 text-cyan-400" />
-                      <span className="text-zinc-500">Proxy</span>
-                      <span className="text-cyan-300 font-mono truncate">{s.proxy ? s.proxy : 'none yet (pool refreshing)'}</span>
-                    </div>
-                  </div>
-                  <div className="flex gap-2 mt-4">
-                    {isRunning ? (
-                      <a href={desktopUrlFor(s)} target="_blank" rel="noopener noreferrer" className="flex-1 flex items-center justify-center gap-1.5 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-black font-bold rounded-lg text-sm shadow-lg shadow-emerald-500/20 transition-colors">
-                        <ExternalLink className="w-4 h-4" /> Open Desktop
-                      </a>
-                    ) : isProvisioning ? (
-                      <button disabled className="flex-1 flex items-center justify-center gap-2 py-2.5 bg-zinc-800 text-zinc-400 font-bold rounded-lg text-sm cursor-wait">
-                        <Loader2 className="w-4 h-4 animate-spin text-amber-400" /> Starting desktop&hellip;
-                      </button>
-                    ) : (
-                      <button disabled className="flex-1 flex items-center justify-center gap-1.5 py-2.5 bg-zinc-800/60 text-zinc-600 font-bold rounded-lg text-sm cursor-not-allowed">
-                        <Power className="w-4 h-4" /> Stopped
-                      </button>
-                    )}
-                    {isActive && (
-                      <button onClick={() => destroySession(s.id)} className="px-3 py-2 border border-red-500/40 text-red-300 rounded-lg text-xs font-bold hover:bg-red-500/10">Stop</button>
-                    )}
-                  </div>
-                  <CopyField label="VNC password" value={s.password} />
-                </div>
-                );
-              })}
-              {vms.map((vm) => (
-                <div key={vm.id} className="bg-zinc-900/40 border border-zinc-800 rounded-2xl p-5">
-                  <div className="flex items-start justify-between">
-                    <div className="flex items-center gap-2">
-                      {vm.os === 'windows' ? <Laptop className="w-5 h-5 text-cyan-400" /> : <Server className="w-5 h-5 text-purple-400" />}
-                      <div>
-                        <div className="font-bold">{vm.os === 'windows' ? 'Windows 10' : 'Linux'} <span className="text-[10px] text-zinc-500">#{vm.vm_id}</span></div>
-                        <div className="text-[11px] text-zinc-500">{vm.sku}</div>
-                      </div>
-                    </div>
-                    <StateBadge state={vm.state} />
-                  </div>
-                  {vm.state === 'running' && (
-                    <div className="mt-4 p-3 bg-black/50 rounded-xl border border-zinc-800 space-y-1.5 font-mono text-xs">
-                      <div className="flex items-center justify-between">
-                        <span className="text-zinc-500 flex items-center gap-1.5"><KeyRound className="w-3.5 h-3.5" /> {vm.os === 'windows' ? 'RDP' : 'SSH'}</span>
-                        <span className="text-cyan-300">10.30.20.85:{vm.port}</span>
-                      </div>
-                      <div className="flex items-center justify-between"><span className="text-zinc-500">user</span><span className="text-amber-300">{vm.username}</span></div>
-                      <div className="flex items-center justify-between"><span className="text-zinc-500">pass</span><span className="text-amber-300">{vm.password}</span></div>
-                      {vm.app && <div className="flex items-center justify-between"><span className="text-zinc-500">app</span><span className="text-purple-300">{vm.app}</span></div>}
-                    </div>
-                  )}
-                  <div className="flex gap-2 mt-4">
-                    {(vm.state === 'running' || vm.state === 'provisioning') && (
-                      <button onClick={() => destroyVm(vm.id)} className="flex-1 py-2 border border-red-500/40 text-red-300 rounded-lg text-xs font-bold hover:bg-red-500/10"><Power className="w-3.5 h-3.5 inline" /> Stop</button>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        <p className="text-center text-[11px] text-zinc-600">
-          ${price}/hr · {freeMachines} machine free · {maxMachines} max · Bitcoin via BTCPay · clean residential proxies on sessions
-        </p>
-      </main>
+/** Inline, dismissible, announced to assistive tech. */
+function Alert({
+  tone = 'error', children, onDismiss, action,
+}: {
+  tone?: 'error' | 'warn' | 'info';
+  children: React.ReactNode;
+  onDismiss?: () => void;
+  action?: React.ReactNode;
+}) {
+  const tones = {
+    error: 'border-red-500/40 bg-red-950/40 text-red-200',
+    warn: 'border-amber-500/40 bg-amber-950/30 text-amber-200',
+    info: 'border-cyan-500/40 bg-cyan-950/30 text-cyan-100',
+  } as const;
+  return (
+    <div
+      role="alert"
+      className={cx('flex flex-wrap items-center gap-3 rounded-xl border px-4 py-3 text-sm', tones[tone])}
+    >
+      <AlertTriangle className="w-4 h-4 shrink-0" aria-hidden="true" />
+      <span className="flex-1 min-w-[12rem]">{children}</span>
+      {action}
+      {onDismiss && (
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Dismiss message"
+          className="rounded-md p-1 hover:bg-white/10"
+        >
+          <X className="w-4 h-4" aria-hidden="true" />
+        </button>
+      )}
     </div>
   );
 }
 
 function StateBadge({ state }: { state: string }) {
-  const cls = state === 'running' ? 'bg-emerald-500/20 text-emerald-300'
-    : state === 'provisioning' ? 'bg-amber-500/20 text-amber-300'
-    : state === 'failed' ? 'bg-red-500/20 text-red-300'
-    : 'bg-zinc-800 text-zinc-400';
-  return <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${cls}`}>{state}</span>;
+  const cls =
+    state === 'running' ? 'bg-emerald-400/15 text-emerald-300 ring-emerald-400/30'
+      : state === 'provisioning' ? 'bg-amber-400/15 text-amber-300 ring-amber-400/30'
+        : state === 'failed' ? 'bg-red-500/15 text-red-300 ring-red-500/30'
+          : 'bg-white/5 text-zinc-400 ring-white/10';
+  return (
+    <span className={cx('rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ring-1', cls)}>
+      {state}
+    </span>
+  );
 }
 
-// Copyable credential row (manual VNC fallback) with Copied feedback.
-function CopyField({ label, value }: { label: string; value: string }) {
+function CopyField({ label, value, secret = false }: { label: string; value: string; secret?: boolean }) {
   const [copied, setCopied] = useState(false);
-  return (
-    <div className="mt-3 flex items-center gap-2 bg-black/50 border border-zinc-800 rounded-lg px-2.5 py-1.5 text-[11px] font-mono">
-      <KeyRound className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-      <span className="text-zinc-500">{label}:</span>
-      <span className="text-amber-300 flex-1 truncate select-all">{value}</span>
-      <button
-        onClick={() => { navigator.clipboard.writeText(value); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
-        className="flex items-center gap-1 text-cyan-400 hover:text-cyan-300 font-bold shrink-0"
-      >
-        {copied ? <><CheckCircle2 className="w-3.5 h-3.5" /> Copied</> : <><Copy className="w-3.5 h-3.5" /> Copy</>}
-      </button>
-    </div>
-  );
-}
+  const [shown, setShown] = useState(!secret);
+  const timer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
 
-function ProductCard({ icon, name, tag, desc, cta, onClick, accent }: {
-  icon: React.ReactNode; name: string; tag: string; desc: string; cta: string;
-  onClick: () => void; accent: 'emerald' | 'cyan' | 'purple';
-}) {
-  const grad = accent === 'emerald' ? 'from-emerald-500 to-teal-600'
-    : accent === 'cyan' ? 'from-cyan-500 to-blue-600'
-    : 'from-purple-500 to-indigo-600';
-  return (
-    <div className="bg-zinc-900/40 border border-zinc-800 rounded-2xl p-5 flex flex-col">
-      <div className="flex items-center gap-2 mb-1">{icon}<span className="font-bold">{name}</span></div>
-      <div className="text-[11px] text-zinc-500 mb-2">{tag}</div>
-      <p className="text-xs text-zinc-400 mb-4 flex-1">{desc}</p>
-      <button onClick={onClick} className={`w-full py-3 bg-gradient-to-r ${grad} text-black font-bold rounded-xl text-sm`}>{cta}</button>
-    </div>
-  );
-}
-
-function TopUpButton({ token, onAdded }: { token: string; onAdded: () => void }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <>
-      <button onClick={() => setOpen(true)} className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-500/20 border border-amber-500/40 text-amber-300 rounded-lg text-xs font-bold hover:bg-amber-500/30">
-        <Bitcoin className="w-3.5 h-3.5" /> Top Up
-      </button>
-      {open && <PayModal token={token} onClose={() => setOpen(false)} onAdded={onAdded} />}
-    </>
-  );
-}
-
-function PayModal({ token, onClose, onAdded }: { token: string; onClose: () => void; onAdded: () => void }) {
-  const [hours, setHours] = useState(5);
-  const [invoice, setInvoice] = useState<any>(null);
-  const [loading, setLoading] = useState(false);
-  const [copied, setCopied] = useState(false);
-
-  const gen = async () => {
-    setLoading(true);
+  const copy = async () => {
     try {
-      const r = await fetch('/api/btcpay/create-invoice', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ usdAmount: hours }) });
-      const d = await r.json();
-      if (r.ok) setInvoice(d);
-    } catch (e) { console.error(e); } finally { setLoading(false); }
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      window.clearTimeout(timer.current);
+      timer.current = window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+    }
   };
 
+  return (
+    <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/40 px-2.5 py-1.5 font-mono text-[11px]">
+      <KeyRound className="w-3.5 h-3.5 shrink-0 text-zinc-500" aria-hidden="true" />
+      <span className="text-zinc-500">{label}</span>
+      <span className={cx('flex-1 truncate select-all', shown ? 'text-amber-300' : 'text-zinc-600')}>
+        {shown ? value : '•'.repeat(Math.min(16, value.length))}
+      </span>
+      {secret && (
+        <button
+          type="button"
+          onClick={() => setShown((v) => !v)}
+          aria-label={shown ? `Hide ${label}` : `Show ${label}`}
+          className="shrink-0 rounded p-0.5 text-zinc-400 hover:text-white"
+        >
+          {shown ? <EyeOff className="w-3.5 h-3.5" aria-hidden="true" /> : <Eye className="w-3.5 h-3.5" aria-hidden="true" />}
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={copy}
+        aria-label={`Copy ${label}`}
+        className="flex shrink-0 items-center gap-1 rounded px-1 font-bold text-cyan-400 hover:text-cyan-300"
+      >
+        {copied
+          ? <><CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" /> Copied</>
+          : <><Copy className="w-3.5 h-3.5" aria-hidden="true" /> Copy</>}
+      </button>
+    </div>
+  );
+}
+
+/* --------------------------------------------------------------- health */
+
+/** Public, unauthenticated status. Drives the landing page's real numbers. */
+function useHealth(): Health | null {
+  const [health, setHealth] = useState<Health | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const r = await fetch('/api/health');
+        if (!r.ok) return;
+        const d = await r.json();
+        if (alive) setHealth(d);
+      } catch { /* offline: the UI just falls back to static copy */ }
+    };
+    load();
+    const t = window.setInterval(load, 30_000);
+    return () => { alive = false; window.clearInterval(t); };
+  }, []);
+  return health;
+}
+
+/* ------------------------------------------------------------------- app */
+
+export default function App() {
+  const [auth, setAuth] = useState<Auth | null>(null);
+  const [restored, setRestored] = useState(false);
+  const [view, setView] = useState<'landing' | 'auth'>('landing');
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(AUTH_KEY);
+      if (raw) {
+        const a = JSON.parse(raw);
+        if (a?.token && a?.user) setAuth(a);
+      }
+    } catch { /* corrupt entry — treat as logged out */ }
+    setRestored(true);
+  }, []);
+
+  const signIn = useCallback((a: Auth) => {
+    try { localStorage.setItem(AUTH_KEY, JSON.stringify(a)); } catch { /* private mode */ }
+    setAuth(a);
+  }, []);
+
+  const signOut = useCallback((token?: string) => {
+    if (token) {
+      // Best-effort server-side token revocation; never blocks the UI.
+      fetch('/api/auth/logout', { method: 'POST', headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
+    }
+    try { localStorage.removeItem(AUTH_KEY); } catch { /* ignore */ }
+    setAuth(null);
+    setView('landing');
+  }, []);
+
+  // Avoid a landing-page flash for returning users while localStorage is read.
+  if (!restored) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-ink-950" aria-busy="true">
+        <span className="sr-only">Loading</span>
+        <Spinner className="w-6 h-6 text-cyan-400" />
+      </div>
+    );
+  }
+
+  if (!auth) {
+    return view === 'landing'
+      ? <LandingPage onLaunch={() => setView('auth')} />
+      : <AuthGate onAuthed={signIn} onBack={() => setView('landing')} />;
+  }
+
+  return <Dashboard auth={auth} setAuth={setAuth} onSignOut={() => signOut(auth.token)} />;
+}
+
+/* ------------------------------------------------------------- dashboard */
+
+function Dashboard({
+  auth, setAuth, onSignOut,
+}: {
+  auth: Auth;
+  setAuth: React.Dispatch<React.SetStateAction<Auth | null>>;
+  onSignOut: () => void;
+}) {
+  const { token } = auth;
+  const [vms, setVms] = useState<ApiVm[]>([]);
+  const [sessions, setSessions] = useState<ApiSession[]>([]);
+  const [meta, setMeta] = useState({
+    gpuSku: 'NVIDIA GeForce RTX 4080 SUPER 16GB',
+    price: 1,
+    maxMachines: 3,
+    freeMachines: 1,
+  });
+  const [loaded, setLoaded] = useState(false);
+  const [connectionLost, setConnectionLost] = useState(false);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState<string | null>(null);
+  const [payOpen, setPayOpen] = useState(false);
+  const [nowTs, setNowTs] = useState(() => Date.now());
+
+  const expired = useRef(false);
+  const signOutRef = useRef(onSignOut);
+  signOutRef.current = onSignOut;
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await fetch('/api/me', { headers: { Authorization: `Bearer ${token}` } });
+      if (r.status === 401) {
+        if (!expired.current) { expired.current = true; signOutRef.current(); }
+        return;
+      }
+      if (!r.ok) { setConnectionLost(true); return; }
+      const d = await r.json();
+      setVms(d.vms || []);
+      setSessions(d.sessions || []);
+      setMeta({
+        gpuSku: d.gpu_sku || 'GPU',
+        price: d.price_per_hour ?? 1,
+        maxMachines: d.max_machines === -1 ? Infinity : (d.max_machines || 3),
+        freeMachines: d.free_machines ?? 1,
+      });
+      setAuth((a) => (a ? { ...a, user: { ...a.user, ...d.user } } : a));
+      setConnectionLost(false);
+      setLoaded(true);
+    } catch {
+      setConnectionLost(true);
+    }
+  }, [token, setAuth]);
+
+  // Poll so provisioning machines flip to "running" without a manual reload.
+  useEffect(() => {
+    refresh();
+    const t = window.setInterval(refresh, 4000);
+    return () => window.clearInterval(t);
+  }, [refresh]);
+
+  // Live uptime counters.
+  useEffect(() => {
+    const t = window.setInterval(() => setNowTs(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, []);
+
+  const user = auth.user;
+  const unlimited = !!user.unlimited;
+
+  const machines = useMemo(
+    () => [...sessions, ...vms].filter((r) => r.state === 'running' || r.state === 'provisioning'),
+    [sessions, vms],
+  );
+  const activeCount = machines.length;
+  const freeSlotsLeft = unlimited ? Infinity : Math.max(0, meta.freeMachines - activeCount);
+  const billableRunning = unlimited ? 0 : Math.max(0, activeCount - meta.freeMachines);
+  const atCap = !unlimited && activeCount >= meta.maxMachines;
+  /** Server rule: past the free allowance, a zero balance is a hard 402. */
+  const needsBalance = !unlimited && freeSlotsLeft === 0 && user.balance_minutes <= 0;
+  const lowBalance = !unlimited && billableRunning > 0 && user.balance_minutes > 0 && user.balance_minutes <= 20;
+
+  const post = useCallback(
+    (path: string, body: unknown) =>
+      fetch(path, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+    [token],
+  );
+
+  const run = useCallback(
+    async (key: string, path: string, body: unknown, fallbackMsg: string) => {
+      if (busy) return;
+      setBusy(key);
+      setError('');
+      try {
+        const r = await post(path, body);
+        if (!r.ok) setError(await readError(r, fallbackMsg));
+        await refresh();
+      } catch {
+        setError('Network error — check your connection and try again.');
+      } finally {
+        setBusy(null);
+      }
+    },
+    [busy, post, refresh],
+  );
+
+  const spawnSession = () => run('session', '/api/session/spawn', { resolution: '1440x900' }, 'Could not start session');
+  const deployVm = (os: 'windows' | 'linux') =>
+    run(os, '/api/vms/provision', { os }, `Could not deploy ${os === 'windows' ? 'Windows' : 'Linux'}`);
+  const destroySession = (id: string) => run(`d:${id}`, '/api/session/destroy', { sessionId: id }, 'Could not stop session');
+  const destroyVm = (id: string) => run(`d:${id}`, '/api/vms/destroy', { vmId: id }, 'Could not stop machine');
+
+  const blocked = atCap
+    ? `Machine limit reached (${meta.maxMachines} max). Stop one first.`
+    : needsBalance
+      ? 'Top up to deploy another machine'
+      : null;
+
+  return (
+    <div className="min-h-screen bg-ink-950 text-zinc-100">
+      <a className="skip-link" href="#console">Skip to console</a>
+
+      <header className="sticky top-0 z-40 border-b border-white/10 bg-ink-950/85 backdrop-blur-xl">
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-5 py-3">
+          <Logo />
+          <div className="flex items-center gap-2 sm:gap-4">
+            <div className="hidden text-right sm:block">
+              <div className="text-[10px] uppercase tracking-widest text-zinc-500">Balance</div>
+              <div className="font-mono text-sm font-bold text-amber-300">
+                {unlimited ? '∞' : fmtBalance(user.balance_minutes)}
+              </div>
+            </div>
+            <button type="button" onClick={() => setPayOpen(true)} className={cx(BTN_AMBER, 'px-3 py-2 text-xs')}>
+              <Bitcoin className="w-4 h-4" aria-hidden="true" />
+              <span className="hidden sm:inline">Buy minutes</span>
+              <span className="sr-only sm:hidden">Buy minutes</span>
+            </button>
+            <div className="hidden text-right md:block">
+              <div className="text-sm font-bold text-cyan-300">
+                @{user.username}
+                {unlimited && <span className="ml-1 text-amber-400" title="Unlimited account">∞</span>}
+              </div>
+              <div className="text-[10px] text-zinc-500">
+                {unlimited ? 'unlimited machines' : `${activeCount}/${meta.maxMachines} machines`}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={onSignOut}
+              aria-label="Sign out"
+              title="Sign out"
+              className="rounded-lg border border-white/10 p-2 text-zinc-400 hover:border-white/25 hover:text-white"
+            >
+              <LogOut className="w-4 h-4" aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main id="console" className="mx-auto max-w-6xl space-y-8 px-5 py-8">
+        <div aria-live="polite" className="space-y-3 empty:hidden">
+          {error && (
+            <Alert
+              onDismiss={() => setError('')}
+              action={
+                /^insufficient balance/i.test(error) ? (
+                  <button type="button" onClick={() => { setError(''); setPayOpen(true); }} className={cx(BTN_AMBER, 'px-3 py-1.5 text-xs')}>
+                    <Bitcoin className="w-3.5 h-3.5" aria-hidden="true" /> Buy minutes
+                  </button>
+                ) : undefined
+              }
+            >
+              {error}
+            </Alert>
+          )}
+          {connectionLost && <Alert tone="warn">Lost contact with the gateway. Retrying every few seconds…</Alert>}
+          {lowBalance && (
+            <Alert
+              tone="warn"
+              action={
+                <button type="button" onClick={() => setPayOpen(true)} className={cx(BTN_AMBER, 'px-3 py-1.5 text-xs')}>
+                  <Bitcoin className="w-3.5 h-3.5" aria-hidden="true" /> Top up
+                </button>
+              }
+            >
+              Only {fmtBalance(user.balance_minutes)} left. Machines stop automatically when the balance hits zero.
+            </Alert>
+          )}
+        </div>
+
+        {/* ---- Account summary ---- */}
+        <section aria-label="Account summary" className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="surface rounded-2xl p-5">
+            <div className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-zinc-500">
+              <Wallet className="w-3.5 h-3.5" aria-hidden="true" /> Balance
+            </div>
+            <div className="mt-2 font-mono text-3xl font-bold text-amber-300">
+              {unlimited ? '∞' : fmtBalance(user.balance_minutes)}
+            </div>
+            <p className="mt-1 text-xs text-zinc-500">
+              {unlimited
+                ? 'Unlimited account — never billed'
+                : `≈ $${(user.balance_minutes / 60 * meta.price).toFixed(2)} of runtime`}
+            </p>
+          </div>
+
+          <div className="surface rounded-2xl p-5">
+            <div className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-zinc-500">
+              <Monitor className="w-3.5 h-3.5" aria-hidden="true" /> Machines
+            </div>
+            <div className="mt-2 font-mono text-3xl font-bold text-cyan-300">
+              {activeCount}
+              <span className="text-lg text-zinc-600">/{unlimited ? '∞' : meta.maxMachines}</span>
+            </div>
+            <p className="mt-1 text-xs text-zinc-500">
+              {unlimited
+                ? 'No concurrency limit'
+                : freeSlotsLeft > 0
+                  ? `${freeSlotsLeft} free slot${freeSlotsLeft === 1 ? '' : 's'} remaining`
+                  : `${billableRunning} billed at $${meta.price}/hr each`}
+            </p>
+          </div>
+
+          <div className="surface rounded-2xl p-5">
+            <div className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-zinc-500">
+              <Zap className="w-3.5 h-3.5" aria-hidden="true" /> Burn rate
+            </div>
+            <div className="mt-2 font-mono text-3xl font-bold text-zinc-100">
+              ${(billableRunning * meta.price).toFixed(2)}
+              <span className="text-lg text-zinc-600">/hr</span>
+            </div>
+            <p className="mt-1 text-xs text-zinc-500">
+              {billableRunning === 0 ? 'Nothing billing right now' : `${billableRunning} billable machine${billableRunning === 1 ? '' : 's'}`}
+            </p>
+          </div>
+
+          <div className="surface rounded-2xl p-5">
+            <div className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-zinc-500">
+              <Cpu className="w-3.5 h-3.5" aria-hidden="true" /> Hardware
+            </div>
+            <div className="mt-2 text-sm font-semibold leading-snug text-zinc-100">{meta.gpuSku}</div>
+            <p className="mt-1 text-xs text-zinc-500">Dedicated passthrough, not shared</p>
+          </div>
+        </section>
+
+        {/* ---- Deploy ---- */}
+        <section aria-labelledby="deploy-h">
+          <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
+            <h2 id="deploy-h" className="text-xl font-bold tracking-tight">Deploy a machine</h2>
+            <p className="text-xs text-zinc-500">
+              ${meta.price}/hr · first {meta.freeMachines} machine{meta.freeMachines === 1 ? '' : 's'} free
+            </p>
+          </div>
+          <div className="grid gap-4 md:grid-cols-3">
+            <ProductCard
+              icon={<Terminal className="w-6 h-6" aria-hidden="true" />}
+              accent="emerald"
+              name="Ubuntu GPU Session"
+              tag="In-browser desktop"
+              desc="A full Ubuntu desktop streamed to your browser with the GPU attached. Install anything, run any CUDA job."
+              cta="Spawn session"
+              onClick={spawnSession}
+              busy={busy === 'session'}
+              disabled={!!busy || !!blocked}
+              blockedReason={blocked}
+              onBlockedAction={needsBalance && !atCap ? () => setPayOpen(true) : undefined}
+            />
+            <ProductCard
+              icon={<Laptop className="w-6 h-6" aria-hidden="true" />}
+              accent="cyan"
+              name="Windows 10"
+              tag="RDP · full desktop"
+              desc="A real Windows 10 VM over RDP. Games, GUI apps and CUDA workloads on a genuine desktop."
+              cta="Deploy Windows"
+              onClick={() => deployVm('windows')}
+              busy={busy === 'windows'}
+              disabled={!!busy || !!blocked}
+              blockedReason={blocked}
+              onBlockedAction={needsBalance && !atCap ? () => setPayOpen(true) : undefined}
+            />
+            <ProductCard
+              icon={<Server className="w-6 h-6" aria-hidden="true" />}
+              accent="violet"
+              name="Linux"
+              tag="SSH · headless"
+              desc="Debian over SSH for headless compute, Docker and long-running server jobs."
+              cta="Deploy Linux"
+              onClick={() => deployVm('linux')}
+              busy={busy === 'linux'}
+              disabled={!!busy || !!blocked}
+              blockedReason={blocked}
+              onBlockedAction={needsBalance && !atCap ? () => setPayOpen(true) : undefined}
+            />
+          </div>
+        </section>
+
+        {/* ---- Resources ---- */}
+        <section aria-labelledby="res-h">
+          <h2 id="res-h" className="mb-4 text-xl font-bold tracking-tight">Your machines</h2>
+
+          {!loaded ? (
+            <div className="grid gap-4 md:grid-cols-2" aria-busy="true">
+              <span className="sr-only">Loading your machines</span>
+              <div className="skeleton h-56 rounded-2xl" />
+              <div className="skeleton h-56 rounded-2xl" />
+            </div>
+          ) : vms.length === 0 && sessions.length === 0 ? (
+            <div className="surface rounded-2xl px-6 py-14 text-center">
+              <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/10 bg-white/5">
+                <Monitor className="w-6 h-6 text-cyan-400" aria-hidden="true" />
+              </div>
+              <h3 className="text-base font-semibold text-zinc-100">Nothing running yet</h3>
+              <p className="mx-auto mt-2 max-w-sm text-sm text-zinc-500">
+                {needsBalance
+                  ? 'Your free allowance is in use. Buy minutes with Bitcoin to start another machine.'
+                  : `Your first ${meta.freeMachines} machine${meta.freeMachines === 1 ? '' : 's'} cost nothing. Spawn an Ubuntu GPU session to get going.`}
+              </p>
+              <div className="mt-6 flex flex-wrap justify-center gap-3">
+                <button
+                  type="button"
+                  onClick={spawnSession}
+                  disabled={!!busy || !!blocked}
+                  className={cx(BTN_PRIMARY, 'px-5 py-2.5 text-sm')}
+                >
+                  {busy === 'session' ? <Spinner /> : <Terminal className="w-4 h-4" aria-hidden="true" />}
+                  {busy === 'session' ? 'Starting…' : 'Spawn Ubuntu session'}
+                </button>
+                <button type="button" onClick={() => setPayOpen(true)} className={cx(BTN_GHOST, 'px-5 py-2.5 text-sm')}>
+                  <Bitcoin className="w-4 h-4" aria-hidden="true" /> Buy minutes
+                </button>
+              </div>
+            </div>
+          ) : (
+            <ul className="grid list-none gap-4 p-0 md:grid-cols-2">
+              {sessions.map((s) => (
+                <li key={s.id}>
+                  <SessionCard
+                    s={s}
+                    gpuSku={meta.gpuSku}
+                    now={nowTs}
+                    busy={busy === `d:${s.id}`}
+                    disabled={!!busy}
+                    onStop={() => destroySession(s.id)}
+                  />
+                </li>
+              ))}
+              {vms.map((vm) => (
+                <li key={vm.id}>
+                  <VmCard
+                    vm={vm}
+                    now={nowTs}
+                    busy={busy === `d:${vm.id}`}
+                    disabled={!!busy}
+                    onStop={() => destroyVm(vm.id)}
+                  />
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <p className="border-t border-white/10 pt-6 text-center text-xs text-zinc-600">
+          ${meta.price}/hr per billed machine · first {meta.freeMachines} free ·{' '}
+          {unlimited ? 'unlimited' : meta.maxMachines} concurrent max · Bitcoin via BTCPay
+        </p>
+      </main>
+
+      {payOpen && <PayModal token={token} pricePerHour={meta.price} currentMinutes={user.balance_minutes} onClose={() => setPayOpen(false)} onCredited={refresh} />}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------ dash cards */
+
+const ACCENTS = {
+  emerald: { text: 'text-emerald-400', ring: 'hover:border-emerald-400/40', btn: 'bg-emerald-400 text-ink-950 hover:bg-emerald-300' },
+  cyan: { text: 'text-cyan-400', ring: 'hover:border-cyan-400/40', btn: 'bg-cyan-400 text-ink-950 hover:bg-cyan-300' },
+  violet: { text: 'text-violet-400', ring: 'hover:border-violet-400/40', btn: 'bg-violet-400 text-ink-950 hover:bg-violet-300' },
+} as const;
+
+function ProductCard({
+  icon, name, tag, desc, cta, onClick, accent, busy, disabled, blockedReason, onBlockedAction,
+}: {
+  icon: React.ReactNode; name: string; tag: string; desc: string; cta: string;
+  onClick: () => void; accent: keyof typeof ACCENTS;
+  busy: boolean; disabled: boolean; blockedReason: string | null;
+  onBlockedAction?: () => void;
+}) {
+  const a = ACCENTS[accent];
+  const showTopUp = !!blockedReason && !!onBlockedAction;
+  return (
+    <div className={cx('surface surface-hover flex flex-col rounded-2xl p-5', a.ring)}>
+      <div className={cx('mb-3 flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-white/5', a.text)}>
+        {icon}
+      </div>
+      <h3 className="font-semibold text-zinc-100">{name}</h3>
+      <p className={cx('mt-0.5 text-[11px] font-medium uppercase tracking-wider', a.text)}>{tag}</p>
+      <p className="mt-3 flex-1 text-sm leading-relaxed text-zinc-400">{desc}</p>
+
+      {showTopUp ? (
+        <button type="button" onClick={onBlockedAction} className={cx(BTN_AMBER, 'mt-5 w-full py-3 text-sm')}>
+          <Bitcoin className="w-4 h-4" aria-hidden="true" /> {blockedReason}
+        </button>
+      ) : (
+        <button
+          type="button"
+          onClick={onClick}
+          disabled={disabled || busy}
+          aria-busy={busy}
+          title={blockedReason ?? undefined}
+          className={cx(BTN_BASE, a.btn, 'mt-5 w-full py-3 text-sm')}
+        >
+          {busy ? <><Spinner /> Starting…</> : <>{cta} <ArrowRight className="w-4 h-4" aria-hidden="true" /></>}
+        </button>
+      )}
+
+      {blockedReason && !showTopUp && (
+        <p className="mt-2 text-center text-[11px] text-amber-400">{blockedReason}</p>
+      )}
+    </div>
+  );
+}
+
+function SessionCard({
+  s, gpuSku, now, busy, disabled, onStop,
+}: {
+  s: ApiSession; gpuSku: string; now: number; busy: boolean; disabled: boolean; onStop: () => void;
+}) {
+  const isRunning = s.state === 'running';
+  const isProvisioning = s.state === 'provisioning';
+  const isActive = isRunning || isProvisioning;
+
+  return (
+    <article
+      className={cx(
+        'surface flex h-full flex-col rounded-2xl p-5',
+        isRunning && 'border-emerald-400/35 shadow-[0_20px_50px_-30px_rgba(16,185,129,0.7)]',
+        isProvisioning && 'border-amber-400/30',
+      )}
+    >
+      <header className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-emerald-400">
+            <Terminal className="w-4 h-4" aria-hidden="true" />
+          </span>
+          <div className="min-w-0">
+            <h3 className="truncate font-semibold">Ubuntu GPU Session</h3>
+            <p className="truncate font-mono text-[11px] text-zinc-500">{s.instance_id} · {gpuSku}</p>
+          </div>
+        </div>
+        <StateBadge state={s.state} />
+      </header>
+
+      <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-[11px]">
+        <div>
+          <dt className="text-zinc-500">Resolution</dt>
+          <dd className="font-mono text-zinc-200">{s.resolution}</dd>
+        </div>
+        <div>
+          <dt className="flex items-center gap-1 text-zinc-500"><Clock className="w-3 h-3" aria-hidden="true" /> Uptime</dt>
+          <dd className="font-mono text-zinc-200">{isActive ? fmtUptime(s.created_at, now) : '—'}</dd>
+        </div>
+        <div className="col-span-2">
+          <dt className="flex items-center gap-1 text-zinc-500"><Globe className="w-3 h-3" aria-hidden="true" /> Egress proxy</dt>
+          <dd className="truncate font-mono text-cyan-300">{s.proxy || 'none assigned (pool refreshing)'}</dd>
+        </div>
+      </dl>
+
+      <div className="mt-auto pt-4">
+        <div className="flex gap-2">
+          {isRunning ? (
+            <a
+              href={desktopUrlFor(s)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={cx(BTN_BASE, 'flex-1 bg-emerald-400 py-2.5 text-sm text-ink-950 hover:bg-emerald-300')}
+            >
+              <ExternalLink className="w-4 h-4" aria-hidden="true" /> Open desktop
+            </a>
+          ) : isProvisioning ? (
+            <span className={cx(BTN_BASE, 'flex-1 cursor-wait bg-white/5 py-2.5 text-sm text-zinc-300')} aria-live="polite">
+              <Spinner className="w-4 h-4 text-amber-400" /> Booting desktop…
+            </span>
+          ) : (
+            <span className={cx(BTN_BASE, 'flex-1 bg-white/5 py-2.5 text-sm text-zinc-500')}>
+              <Power className="w-4 h-4" aria-hidden="true" /> {s.state === 'failed' ? 'Failed to start' : 'Stopped'}
+            </span>
+          )}
+          {isActive && (
+            <button
+              type="button"
+              onClick={onStop}
+              disabled={disabled}
+              aria-busy={busy}
+              aria-label={`Stop session ${s.instance_id}`}
+              className={cx(BTN_BASE, 'border border-red-500/40 px-4 py-2.5 text-xs text-red-300 hover:bg-red-500/10')}
+            >
+              {busy ? <Spinner className="w-3.5 h-3.5" /> : <Power className="w-3.5 h-3.5" aria-hidden="true" />} Stop
+            </button>
+          )}
+        </div>
+        <div className="mt-3">
+          <CopyField label="VNC password" value={s.password} secret />
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function VmCard({
+  vm, now, busy, disabled, onStop,
+}: {
+  vm: ApiVm; now: number; busy: boolean; disabled: boolean; onStop: () => void;
+}) {
+  const isWin = vm.os === 'windows';
+  const isActive = vm.state === 'running' || vm.state === 'provisioning';
+  return (
+    <article
+      className={cx(
+        'surface flex h-full flex-col rounded-2xl p-5',
+        vm.state === 'running' && (isWin ? 'border-cyan-400/35' : 'border-violet-400/35'),
+      )}
+    >
+      <header className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-3">
+          <span className={cx('flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/5', isWin ? 'text-cyan-400' : 'text-violet-400')}>
+            {isWin ? <Laptop className="w-4 h-4" aria-hidden="true" /> : <Server className="w-4 h-4" aria-hidden="true" />}
+          </span>
+          <div className="min-w-0">
+            <h3 className="truncate font-semibold">{isWin ? 'Windows 10' : 'Linux'}</h3>
+            <p className="truncate font-mono text-[11px] text-zinc-500">#{vm.vm_id} · {vm.sku}</p>
+          </div>
+        </div>
+        <StateBadge state={vm.state} />
+      </header>
+
+      {vm.state === 'provisioning' && (
+        <p className="mt-4 flex items-center gap-2 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-xs text-amber-200" aria-live="polite">
+          <Spinner className="w-3.5 h-3.5" /> Cloning the template and booting — this takes a couple of minutes.
+        </p>
+      )}
+      {vm.state === 'failed' && (
+        <p className="mt-4 rounded-lg border border-red-500/30 bg-red-950/30 px-3 py-2 text-xs text-red-200">
+          Provisioning failed. Nothing was charged for this machine — try deploying again.
+        </p>
+      )}
+
+      {vm.state === 'running' && (
+        <div className="mt-4 space-y-2">
+          <div className="flex items-center justify-between rounded-lg border border-white/10 bg-black/40 px-2.5 py-1.5 font-mono text-[11px]">
+            <span className="flex items-center gap-1.5 text-zinc-500">
+              <KeyRound className="w-3.5 h-3.5" aria-hidden="true" /> {isWin ? 'RDP' : 'SSH'}
+            </span>
+            <span className="text-cyan-300">port {vm.port ?? '—'}</span>
+          </div>
+          {vm.username && <CopyField label="user" value={vm.username} />}
+          {vm.password && <CopyField label="pass" value={vm.password} secret />}
+          <p className="flex items-center gap-1.5 text-[11px] text-zinc-500">
+            <Clock className="w-3 h-3" aria-hidden="true" /> Uptime {fmtUptime(vm.created_at, now)}
+          </p>
+        </div>
+      )}
+
+      {isActive && (
+        <div className="mt-auto pt-4">
+          <button
+            type="button"
+            onClick={onStop}
+            disabled={disabled}
+            aria-busy={busy}
+            aria-label={`Stop ${isWin ? 'Windows' : 'Linux'} machine ${vm.vm_id}`}
+            className={cx(BTN_BASE, 'w-full border border-red-500/40 py-2.5 text-xs text-red-300 hover:bg-red-500/10')}
+          >
+            {busy ? <Spinner className="w-3.5 h-3.5" /> : <Power className="w-3.5 h-3.5" aria-hidden="true" />}
+            {busy ? 'Stopping…' : 'Stop machine'}
+          </button>
+        </div>
+      )}
+    </article>
+  );
+}
+
+/* ------------------------------------------------------------- pay modal */
+
+const PRESETS = [1, 5, 12, 24];
+
+function PayModal({
+  token, pricePerHour, currentMinutes, onClose, onCredited,
+}: {
+  token: string; pricePerHour: number; currentMinutes: number;
+  onClose: () => void; onCredited: () => void;
+}) {
+  const [usd, setUsd] = useState(5);
+  const [invoice, setInvoice] = useState<{ amountUsd: number; minutesAdded: number; checkoutLink: string } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [credited, setCredited] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const baseline = useRef(currentMinutes);
+
+  // Escape to close + focus trapped inside the dialog.
+  useEffect(() => {
+    const prev = document.activeElement as HTMLElement | null;
+    dialogRef.current?.querySelector<HTMLElement>('button, [href], input')?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.stopPropagation(); onClose(); return; }
+      if (e.key !== 'Tab' || !dialogRef.current) return;
+      const all: HTMLElement[] = [];
+      dialogRef.current
+        .querySelectorAll<HTMLElement>('button, [href], input, [tabindex]:not([tabindex="-1"])')
+        .forEach((n) => all.push(n));
+      const nodes = all.filter((n) => !n.hasAttribute('disabled'));
+      if (!nodes.length) return;
+      const first = nodes[0], last = nodes[nodes.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    };
+    document.addEventListener('keydown', onKey, true);
+    const overflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKey, true);
+      document.body.style.overflow = overflow;
+      prev?.focus?.();
+    };
+  }, [onClose]);
+
+  const create = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const r = await fetch('/api/btcpay/create-invoice', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ usdAmount: usd }),
+      });
+      if (!r.ok) { setError(await readError(r, 'Could not create the invoice')); return; }
+      const d = await r.json();
+      if (!d?.checkoutLink) { setError('BTCPay returned no checkout link. Try again shortly.'); return; }
+      setInvoice(d);
+    } catch {
+      setError('Network error — could not reach the payment service.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Watch for the webhook crediting the balance; stop after 20 minutes.
   useEffect(() => {
     if (!invoice) return;
-    const t = setInterval(async () => {
-      const r = await fetch('/api/me', { headers: { Authorization: `Bearer ${token}` } });
-      if (r.ok) { const d = await r.json(); if (d.user.balance_minutes > 0) { onAdded(); onClose(); } }
+    let ticks = 0;
+    const t = window.setInterval(async () => {
+      ticks++;
+      if (ticks > 240) { window.clearInterval(t); return; }
+      try {
+        const r = await fetch('/api/me', { headers: { Authorization: `Bearer ${token}` } });
+        if (!r.ok) return;
+        const d = await r.json();
+        if ((d?.user?.balance_minutes ?? 0) > baseline.current) {
+          window.clearInterval(t);
+          setCredited(true);
+          onCredited();
+        }
+      } catch { /* keep waiting */ }
     }, 5000);
-    return () => clearInterval(t);
-  }, [invoice, token]);
+    return () => window.clearInterval(t);
+  }, [invoice, token, onCredited]);
+
+  const minutes = Math.round((usd / (pricePerHour || 1)) * 60);
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur p-4 overflow-y-auto">
-      <div className="w-full max-w-md bg-zinc-950 border border-amber-500/40 rounded-2xl p-6 max-h-[85vh] overflow-y-auto my-auto">
-        <div className="flex items-center justify-between mb-5">
-          <h3 className="font-bold text-lg flex items-center gap-2"><Bitcoin className="w-5 h-5 text-amber-400" /> Top Up Balance</h3>
-          <button onClick={onClose} className="text-zinc-500 hover:text-white"><X className="w-5 h-5" /></button>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/80 p-4 backdrop-blur-sm"
+      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="pay-title"
+        className="surface my-auto w-full max-w-md rounded-2xl border-amber-400/30 p-6"
+      >
+        <div className="mb-5 flex items-start justify-between gap-3">
+          <div>
+            <h2 id="pay-title" className="flex items-center gap-2 text-lg font-bold">
+              <Bitcoin className="w-5 h-5 text-amber-400" aria-hidden="true" /> Buy GPU minutes
+            </h2>
+            <p className="mt-1 text-xs text-zinc-500">Paid in Bitcoin via BTCPay. No card, no account details.</p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close dialog"
+            className="rounded-lg p-1.5 text-zinc-500 hover:bg-white/5 hover:text-white"
+          >
+            <X className="w-5 h-5" aria-hidden="true" />
+          </button>
         </div>
-        {!invoice ? (
-          <div className="space-y-4">
-            <div className="grid grid-cols-4 gap-2">
-              {[1, 5, 12, 24].map((h) => (
-                <button key={h} onClick={() => setHours(h)} className={`p-3 rounded-lg border text-center ${hours === h ? 'border-amber-500 bg-amber-500/10 text-amber-300' : 'border-zinc-800 text-zinc-400'}`}>
-                  <div className="font-bold">${h}</div><div className="text-[10px]">{h}h</div>
-                </button>
-              ))}
-            </div>
-            <button onClick={gen} disabled={loading} className="w-full py-3 bg-amber-500 text-black font-bold rounded-xl">{loading ? 'Creating...' : `Pay $${hours} for ${hours} hours`}</button>
+
+        <div aria-live="polite">
+          {error && <div className="mb-4"><Alert onDismiss={() => setError('')}>{error}</Alert></div>}
+        </div>
+
+        {credited ? (
+          <div className="py-6 text-center">
+            <CheckCircle2 className="mx-auto mb-3 h-10 w-10 text-emerald-400" aria-hidden="true" />
+            <h3 className="font-semibold text-emerald-300">Payment confirmed</h3>
+            <p className="mt-1 text-sm text-zinc-400">Your balance has been credited.</p>
+            <button type="button" onClick={onClose} className={cx(BTN_PRIMARY, 'mt-5 w-full py-3 text-sm')}>
+              Back to console
+            </button>
+          </div>
+        ) : !invoice ? (
+          <div className="space-y-5">
+            <fieldset>
+              <legend className="mb-2 text-xs font-medium uppercase tracking-widest text-zinc-500">Amount</legend>
+              <div className="grid grid-cols-4 gap-2">
+                {PRESETS.map((h) => (
+                  <button
+                    key={h}
+                    type="button"
+                    onClick={() => setUsd(h)}
+                    aria-pressed={usd === h}
+                    className={cx(
+                      'rounded-xl border p-3 text-center transition-colors',
+                      usd === h
+                        ? 'border-amber-400 bg-amber-400/10 text-amber-300'
+                        : 'border-white/10 text-zinc-400 hover:border-white/25',
+                    )}
+                  >
+                    <span className="block font-bold">${h}</span>
+                    <span className="block text-[10px]">{h}h</span>
+                  </button>
+                ))}
+              </div>
+            </fieldset>
+
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-medium uppercase tracking-widest text-zinc-500">Or a custom amount (USD)</span>
+              <input
+                type="number"
+                min={1}
+                max={1000}
+                step={1}
+                value={usd}
+                onChange={(e) => setUsd(Math.max(1, Math.min(1000, Math.round(Number(e.target.value) || 1))))}
+                className="w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3 font-mono text-sm text-amber-300 outline-none focus:border-amber-400"
+              />
+            </label>
+
+            <p className="rounded-xl border border-white/10 bg-black/30 px-4 py-3 text-sm text-zinc-400">
+              <span className="font-mono text-amber-300">${usd}.00</span> credits{' '}
+              <span className="font-mono text-zinc-100">{minutes}</span> minutes
+              <span className="text-zinc-500"> ({fmtBalance(minutes)}) of billed runtime.</span>
+            </p>
+
+            <button type="button" onClick={create} disabled={loading} aria-busy={loading} className={cx(BTN_AMBER, 'w-full py-3 text-sm')}>
+              {loading ? <><Spinner /> Creating invoice…</> : <>Continue to Bitcoin checkout <ArrowRight className="w-4 h-4" aria-hidden="true" /></>}
+            </button>
           </div>
         ) : (
           <div className="space-y-4">
-            <div className="p-3 bg-zinc-900 rounded-xl text-center">
-              <div className="text-2xl font-bold text-amber-400">${invoice.amountUsd}.00</div>
-              <div className="text-xs text-zinc-500">credits {invoice.minutesAdded} minutes</div>
+            <div className="rounded-xl border border-white/10 bg-black/30 p-4 text-center">
+              <div className="font-mono text-3xl font-bold text-amber-400">${invoice.amountUsd}.00</div>
+              <div className="mt-1 text-xs text-zinc-500">credits {invoice.minutesAdded} minutes</div>
             </div>
-            <a href={invoice.checkoutLink} target="_blank" rel="noopener noreferrer" className="flex items-center justify-center gap-2 w-full py-3 bg-amber-500 text-black font-bold rounded-xl"><ExternalLink className="w-4 h-4" /> Open Bitcoin Checkout</a>
-            <div className="flex items-center gap-2 bg-black p-2 rounded-lg text-xs">
-              <span className="flex-1 text-cyan-300 truncate">{invoice.checkoutLink}</span>
-              <button onClick={() => { navigator.clipboard.writeText(invoice.checkoutLink); setCopied(true); setTimeout(() => setCopied(false), 2000); }} className="text-amber-400 text-[11px]">{copied ? 'Copied' : 'Copy'}</button>
+            <a
+              href={invoice.checkoutLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={cx(BTN_AMBER, 'w-full py-3 text-sm')}
+            >
+              <ExternalLink className="w-4 h-4" aria-hidden="true" /> Open Bitcoin checkout
+            </a>
+            <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/40 px-2.5 py-2 text-xs">
+              <span className="flex-1 truncate font-mono text-cyan-300">{invoice.checkoutLink}</span>
+              <button
+                type="button"
+                aria-label="Copy checkout link"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(invoice.checkoutLink);
+                    setCopied(true);
+                    window.setTimeout(() => setCopied(false), 1600);
+                  } catch { /* clipboard blocked */ }
+                }}
+                className="font-bold text-amber-400 hover:text-amber-300"
+              >
+                {copied ? 'Copied' : 'Copy'}
+              </button>
             </div>
-            <p className="text-[11px] text-zinc-500 text-center">Balance credited automatically once payment confirms on-chain.</p>
+            <p className="flex items-center justify-center gap-2 text-center text-[11px] text-zinc-500" aria-live="polite">
+              <Spinner className="w-3 h-3" /> Waiting for on-chain confirmation — your balance credits automatically.
+            </p>
           </div>
         )}
       </div>
     </div>,
-    document.body
+    document.body,
   );
 }
 
-function LandingPage({ onLaunch }: { onLaunch: () => void }) {
+/* ------------------------------------------------------------- auth gate */
+
+function AuthGate({ onAuthed, onBack }: { onAuthed: (a: Auth) => void; onBack: () => void }) {
+  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPw, setShowPw] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const health = useHealth();
+
+  // Mirrors the server's validation exactly, so users never round-trip for it.
+  const usernameOk = /^[a-zA-Z0-9_.-]{3,32}$/.test(username.trim());
+  const passwordOk = password.length >= 6;
+  const canSubmit = mode === 'login'
+    ? username.trim().length > 0 && password.length > 0
+    : usernameOk && passwordOk;
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!canSubmit || loading) return;
+    setLoading(true);
+    setError('');
+    try {
+      const path = mode === 'login' ? '/api/auth/login' : '/api/auth/register';
+      const r = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: username.trim(), password }),
+      });
+      if (!r.ok) { setError(await readError(r, mode === 'login' ? 'Sign in failed' : 'Registration failed')); return; }
+      const d = await r.json();
+      if (!d?.token) { setError('Unexpected response from the server.'); return; }
+      onAuthed({ token: d.token, user: d.user });
+    } catch {
+      setError('Network error — could not reach the gateway.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const inputCls =
+    'w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-sm text-zinc-100 ' +
+    'placeholder:text-zinc-600 outline-none focus:border-cyan-400';
+
   return (
-    <div className="min-h-screen bg-[#05070d] text-zinc-100 font-sans overflow-x-hidden">
-      {/* Nav */}
-      <header className="border-b border-zinc-800/70 bg-zinc-950/60 backdrop-blur sticky top-0 z-40">
-        <div className="max-w-6xl mx-auto px-5 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-2 font-black tracking-tight text-white text-lg">
-            <Cpu className="w-5 h-5 text-cyan-400" /> VORTEX<span className="text-cyan-400">GPU</span>
-          </div>
-          <nav className="hidden md:flex items-center gap-6 text-sm text-zinc-400">
-            <a href="#features" className="hover:text-white transition-colors">Features</a>
-            <a href="#pricing" className="hover:text-white transition-colors">Pricing</a>
-            <a href="#how" className="hover:text-white transition-colors">How it works</a>
-          </nav>
-          <button onClick={onLaunch} className="px-4 py-2 bg-cyan-500 hover:bg-cyan-400 text-black font-bold rounded-lg text-sm transition-colors">Launch Console</button>
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden px-5 py-12">
+      <div className="pointer-events-none absolute inset-0 bg-aurora" aria-hidden="true" />
+      <div className="pointer-events-none absolute inset-0 bg-grid" aria-hidden="true" />
+
+      <div className="relative w-full max-w-md">
+        <button
+          type="button"
+          onClick={onBack}
+          className="mb-6 inline-flex items-center gap-1.5 text-sm text-zinc-400 hover:text-white"
+        >
+          <ArrowRight className="w-4 h-4 rotate-180" aria-hidden="true" /> Back to home
+        </button>
+
+        <div className="mb-8 text-center">
+          <Logo className="text-2xl" />
+          <h1 className="mt-4 text-2xl font-bold tracking-tight">
+            {mode === 'login' ? 'Welcome back' : 'Create your account'}
+          </h1>
+          <p className="mt-2 text-sm text-zinc-400">
+            Username and password only. No email, no KYC, no card.
+          </p>
         </div>
+
+        <div role="tablist" aria-label="Authentication mode" className="mb-4 grid grid-cols-2 gap-2">
+          {(['login', 'register'] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              role="tab"
+              aria-selected={mode === m}
+              onClick={() => { setMode(m); setError(''); }}
+              className={cx(
+                'flex items-center justify-center gap-2 rounded-xl border py-2.5 text-sm font-semibold transition-colors',
+                mode === m
+                  ? 'border-cyan-400 bg-cyan-400/10 text-cyan-300'
+                  : 'border-white/10 text-zinc-400 hover:border-white/25',
+              )}
+            >
+              {m === 'login'
+                ? <><LogIn className="w-4 h-4" aria-hidden="true" /> Sign in</>
+                : <><UserPlus className="w-4 h-4" aria-hidden="true" /> Register</>}
+            </button>
+          ))}
+        </div>
+
+        <form onSubmit={submit} noValidate className="surface space-y-4 rounded-2xl p-6">
+          <div>
+            <label htmlFor="username" className="mb-1.5 block text-xs font-medium uppercase tracking-widest text-zinc-500">
+              Username
+            </label>
+            <input
+              id="username"
+              name="username"
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="satoshi"
+              autoComplete="username"
+              autoCapitalize="none"
+              spellCheck={false}
+              required
+              aria-describedby="username-hint"
+              className={inputCls}
+            />
+            <p id="username-hint" className={cx('mt-1.5 text-[11px]', mode === 'register' && username && !usernameOk ? 'text-amber-400' : 'text-zinc-600')}>
+              3–32 characters: letters, numbers, and <span className="font-mono">_ . -</span>
+            </p>
+          </div>
+
+          <div>
+            <label htmlFor="password" className="mb-1.5 block text-xs font-medium uppercase tracking-widest text-zinc-500">
+              Password
+            </label>
+            <div className="relative">
+              <input
+                id="password"
+                name="password"
+                type={showPw ? 'text' : 'password'}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder={mode === 'register' ? 'at least 6 characters' : 'your password'}
+                autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+                required
+                aria-describedby="password-hint"
+                className={cx(inputCls, 'pr-12')}
+              />
+              <button
+                type="button"
+                onClick={() => setShowPw((v) => !v)}
+                aria-label={showPw ? 'Hide password' : 'Show password'}
+                className="absolute inset-y-0 right-0 flex items-center px-3 text-zinc-500 hover:text-white"
+              >
+                {showPw ? <EyeOff className="w-4 h-4" aria-hidden="true" /> : <Eye className="w-4 h-4" aria-hidden="true" />}
+              </button>
+            </div>
+            <p id="password-hint" className={cx('mt-1.5 text-[11px]', mode === 'register' && password && !passwordOk ? 'text-amber-400' : 'text-zinc-600')}>
+              {mode === 'register'
+                ? 'Minimum 6 characters. There is no email recovery — store it safely.'
+                : 'Accounts are anonymous; passwords cannot be reset.'}
+            </p>
+          </div>
+
+          <div aria-live="assertive">
+            {error && <Alert onDismiss={() => setError('')}>{error}</Alert>}
+          </div>
+
+          <button type="submit" disabled={!canSubmit || loading} aria-busy={loading} className={cx(BTN_PRIMARY, 'w-full py-3 text-sm')}>
+            {loading
+              ? <><Spinner /> {mode === 'login' ? 'Signing in…' : 'Creating account…'}</>
+              : mode === 'login' ? 'Sign in' : 'Create account'}
+          </button>
+        </form>
+
+        <p className="mt-5 text-center text-[11px] text-zinc-600">
+          ${health?.priceUsdPerHour ?? 1}/hr · first {health?.freeMachines ?? 1} machine free · up to{' '}
+          {health?.maxVmsPerUser ?? 3} concurrent · Bitcoin via BTCPay
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------- landing page */
+
+const NAV_LINKS = [
+  { href: '#hardware', label: 'Hardware' },
+  { href: '#pricing', label: 'Pricing' },
+  { href: '#how', label: 'How it works' },
+  { href: '#faq', label: 'FAQ' },
+];
+
+function LandingPage({ onLaunch }: { onLaunch: () => void }) {
+  const health = useHealth();
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  const price = health?.priceUsdPerHour ?? 1;
+  const freeMachines = health?.freeMachines ?? 1;
+  const maxMachines = health?.maxVmsPerUser ?? 3;
+  const gpuSku = health?.gpuSku ?? 'NVIDIA GeForce RTX 4080 SUPER 16GB';
+  const nodesOnline = health?.gpuNodesOnline ?? null;
+
+  return (
+    <div className="min-h-screen bg-ink-950 text-zinc-100">
+      <a className="skip-link" href="#main">Skip to content</a>
+
+      {/* ---- Nav ---- */}
+      <header className="sticky top-0 z-40 border-b border-white/10 bg-ink-950/85 backdrop-blur-xl">
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-5 py-3.5">
+          <a href="#main" className="shrink-0"><Logo /></a>
+
+          <nav aria-label="Primary" className="hidden items-center gap-7 text-sm text-zinc-400 md:flex">
+            {NAV_LINKS.map((l) => (
+              <a key={l.href} href={l.href} className="transition-colors hover:text-white">{l.label}</a>
+            ))}
+          </nav>
+
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={onLaunch} className={cx(BTN_PRIMARY, 'px-4 py-2 text-sm')}>
+              Launch console
+            </button>
+            <button
+              type="button"
+              onClick={() => setMenuOpen((v) => !v)}
+              aria-expanded={menuOpen}
+              aria-controls="mobile-nav"
+              aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+              className="rounded-lg border border-white/10 p-2 text-zinc-300 md:hidden"
+            >
+              {menuOpen ? <X className="w-5 h-5" aria-hidden="true" /> : <Menu className="w-5 h-5" aria-hidden="true" />}
+            </button>
+          </div>
+        </div>
+
+        {menuOpen && (
+          <nav id="mobile-nav" aria-label="Primary mobile" className="border-t border-white/10 md:hidden">
+            <ul className="mx-auto flex max-w-6xl list-none flex-col gap-1 p-3">
+              {NAV_LINKS.map((l) => (
+                <li key={l.href}>
+                  <a
+                    href={l.href}
+                    onClick={() => setMenuOpen(false)}
+                    className="flex items-center justify-between rounded-lg px-3 py-2.5 text-sm text-zinc-300 hover:bg-white/5"
+                  >
+                    {l.label} <ChevronRight className="w-4 h-4 text-zinc-600" aria-hidden="true" />
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </nav>
+        )}
       </header>
 
-      {/* Hero */}
-      <section className="relative">
-        <div className="absolute inset-0 pointer-events-none" style={{ background: 'radial-gradient(ellipse 60% 50% at 50% 0%, rgba(34,211,238,0.14), transparent 70%)' }} />
-        <div className="max-w-6xl mx-auto px-5 py-16 md:py-24 grid md:grid-cols-2 gap-12 items-center relative">
-          <div>
-            <div className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.2em] text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-full px-3 py-1.5 mb-5">
-              <Bitcoin className="w-3.5 h-3.5" /> Bitcoin · No KYC
+      <main id="main">
+        {/* ---- Hero ---- */}
+        <section className="relative overflow-hidden">
+          <div className="pointer-events-none absolute inset-0 bg-aurora" aria-hidden="true" />
+          <div className="pointer-events-none absolute inset-0 bg-grid" aria-hidden="true" />
+          <div className="relative mx-auto grid max-w-6xl items-center gap-12 px-5 py-16 md:py-24 lg:grid-cols-2">
+            <div className="animate-rise">
+              <StatusPill nodesOnline={nodesOnline} />
+
+              <h1 className="mt-6 text-display font-black">
+                Rent a real GPU PC,{' '}
+                <span className="bg-gradient-to-r from-cyan-300 via-cyan-400 to-emerald-400 bg-clip-text text-transparent">
+                  by the hour
+                </span>
+                .
+              </h1>
+
+              <p className="mt-6 max-w-lg text-lg leading-relaxed text-zinc-400">
+                A full Ubuntu desktop with an{' '}
+                <span className="font-semibold text-zinc-100">RTX&nbsp;4080&nbsp;SUPER</span> attached — in your browser
+                in about a minute. Windows over RDP and Linux over SSH too. Settled in Bitcoin, no card and no KYC.
+              </p>
+
+              <div className="mt-9 flex flex-wrap gap-3">
+                <button type="button" onClick={onLaunch} className={cx(BTN_PRIMARY, 'px-6 py-3.5 text-base')}>
+                  Get started — ${price}/hr <ArrowRight className="w-4 h-4" aria-hidden="true" />
+                </button>
+                <a href="#pricing" className={cx(BTN_GHOST, 'px-6 py-3.5 text-base')}>See pricing</a>
+              </div>
+
+              <ul className="mt-9 flex list-none flex-wrap gap-x-6 gap-y-2.5 p-0 text-sm text-zinc-500">
+                {[
+                  `First ${freeMachines} machine free`,
+                  'No email, no KYC',
+                  'Per-minute billing',
+                ].map((t) => (
+                  <li key={t} className="flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" aria-hidden="true" /> {t}
+                  </li>
+                ))}
+              </ul>
             </div>
-            <h1 className="text-4xl md:text-5xl font-black tracking-tight leading-[1.08]">
-              Rent a <span className="text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-emerald-400">real GPU PC</span> by the hour.
-            </h1>
-            <p className="text-zinc-400 text-lg mt-5 max-w-lg leading-relaxed">
-              A full Ubuntu desktop with an <span className="text-white font-semibold">RTX 4080 SUPER</span> in your browser, Windows RDP, and Linux SSH. Settled in Bitcoin — no card, no lock-in.
-            </p>
-            <div className="flex flex-wrap gap-3 mt-8">
-              <button onClick={onLaunch} className="flex items-center gap-2 px-6 py-3.5 bg-gradient-to-r from-cyan-500 to-emerald-500 text-black font-bold rounded-xl hover:opacity-90 transition shadow-lg shadow-cyan-500/20">
-                Get started — $1/hr <ArrowRight className="w-4 h-4" />
-              </button>
-              <a href="#pricing" className="flex items-center gap-2 px-6 py-3.5 border border-zinc-700 text-zinc-200 font-semibold rounded-xl hover:border-zinc-500 transition-colors">
-                See pricing
-              </a>
-            </div>
-            <div className="flex flex-wrap gap-x-6 gap-y-2 mt-8 text-xs text-zinc-500">
-              <span className="flex items-center gap-1.5"><CheckCircle2 className="w-4 h-4 text-emerald-400" /> First machine free</span>
-              <span className="flex items-center gap-1.5"><CheckCircle2 className="w-4 h-4 text-emerald-400" /> 4080 SUPER / 4070</span>
-              <span className="flex items-center gap-1.5"><CheckCircle2 className="w-4 h-4 text-emerald-400" /> Clean residential proxy</span>
+
+            <div className="relative h-[320px] md:h-[420px]">
+              <Suspense
+                fallback={<div className="surface h-full w-full rounded-2xl bg-aurora" aria-hidden="true" />}
+              >
+                <Cyber3DCanvas
+                  vmState="running"
+                  intensity={70}
+                  caption={
+                    <div className="flex items-center justify-between gap-2 rounded-xl border border-white/10 bg-black/60 px-3 py-2 backdrop-blur">
+                      <span className="truncate font-mono text-[11px] text-cyan-300">{gpuSku}</span>
+                      <span className="flex shrink-0 items-center gap-1.5 font-mono text-[11px] text-amber-300">
+                        <Bitcoin className="w-3.5 h-3.5" aria-hidden="true" /> BTC
+                      </span>
+                    </div>
+                  }
+                />
+              </Suspense>
             </div>
           </div>
-          <div className="relative">
-            <div className="h-[380px]">
-              <Cyber3DCanvas vmState="running" gpuLoad={74} />
-            </div>
-            <div className="absolute -bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-amber-500/15 border border-amber-500/40 text-amber-300 text-xs font-bold rounded-full px-4 py-2 whitespace-nowrap">
-              <Bitcoin className="w-4 h-4" /> Settled in BTC via BTCPay
-            </div>
-          </div>
-        </div>
-      </section>
+        </section>
 
-      {/* Stat bar */}
-      <section className="border-y border-zinc-800/70 bg-zinc-950/40">
-        <div className="max-w-6xl mx-auto px-5 py-6 grid grid-cols-2 md:grid-cols-4 gap-6 text-center">
-          {[['$1', 'per hour'], ['1st', 'machine free'], ['RTX 4080', 'SUPER 16GB'], ['BTC', 'via BTCPay']].map(([v, l]) => (
-            <div key={l}>
-              <div className="text-2xl md:text-3xl font-black text-cyan-300">{v}</div>
-              <div className="text-[11px] uppercase tracking-wider text-zinc-500 mt-1">{l}</div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {/* Features */}
-      <section id="features" className="max-w-6xl mx-auto px-5 py-20">
-        <div className="text-center mb-12">
-          <h2 className="text-3xl font-black tracking-tight">Three ways to compute</h2>
-          <p className="text-zinc-500 mt-3 max-w-xl mx-auto">Every machine is a real isolated instance with the GPU attached — not a shared sandbox.</p>
-        </div>
-        <div className="grid md:grid-cols-3 gap-5">
-          <FeatureCard icon={<Terminal className="w-7 h-7 text-emerald-400" />} name="Ubuntu GPU Session" tag="In-browser · 4080 SUPER" desc="A full Ubuntu desktop streaming to your browser with the RTX 4080 attached. Install anything, run any CUDA job." />
-          <FeatureCard icon={<Laptop className="w-7 h-7 text-cyan-400" />} name="Windows 10" tag="RDP · full desktop" desc="A real Windows 10 VM over RDP. Games, GUI apps, CUDA workloads — a genuine desktop." />
-          <FeatureCard icon={<Server className="w-7 h-7 text-purple-400" />} name="Linux" tag="SSH · headless" desc="Debian over SSH for headless compute, docker, and long-running server jobs." />
-        </div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-10">
-          {[
-            [<Gauge className="w-5 h-5 text-cyan-400" />, 'Dedicated GPU', 'Real passthrough, not shared'],
-            [<Shield className="w-5 h-5 text-emerald-400" />, 'No KYC', 'Email-free Bitcoin checkout'],
-            [<Globe className="w-5 h-5 text-purple-400" />, 'Clean proxy', 'Residential IP on sessions'],
-            [<Lock className="w-5 h-5 text-amber-400" />, 'Isolated', 'Your own VM, full root'],
-          ].map(([ic, t, d], i) => (
-            <div key={i} className="bg-zinc-900/40 border border-zinc-800 rounded-xl p-4">
-              <div className="flex items-center gap-2 text-zinc-200 font-semibold text-sm">{ic}{t}</div>
-              <div className="text-[11px] text-zinc-500 mt-1">{d}</div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {/* Pricing */}
-      <section id="pricing" className="border-t border-zinc-800/70 bg-zinc-950/40">
-        <div className="max-w-6xl mx-auto px-5 py-20">
-          <div className="text-center mb-12">
-            <h2 className="text-3xl font-black tracking-tight">Simple, honest pricing</h2>
-            <p className="text-zinc-500 mt-3">Pay in Bitcoin. Credits your balance automatically the moment payment confirms.</p>
-          </div>
-          <div className="grid md:grid-cols-3 gap-5 max-w-4xl mx-auto">
+        {/* ---- Stat bar (real values from /api/health) ---- */}
+        <section aria-label="At a glance" className="border-y border-white/10 bg-white/[0.015]">
+          <div className="mx-auto grid max-w-6xl grid-cols-2 gap-6 px-5 py-8 text-center md:grid-cols-4">
             {[
-              ['1 hour', '$1', 'Try it — your first machine is free', 'from-cyan-500 to-blue-600'],
-              ['5 hours', '$5', 'Most popular for a session', 'from-emerald-500 to-teal-600'],
-              ['24 hours', '$24', 'Best value for long jobs', 'from-purple-500 to-indigo-600'],
-            ].map(([h, p, d, g]) => (
-              <div key={h} className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-7 flex flex-col items-center text-center">
-                <div className="text-sm text-zinc-400 font-semibold">{h}</div>
-                <div className={`text-4xl font-black my-3 text-transparent bg-clip-text bg-gradient-to-r ${g}`}>{p}</div>
-                <div className="text-xs text-zinc-500 mb-6">{d}</div>
-                <button onClick={onLaunch} className={`mt-auto w-full py-3 bg-gradient-to-r ${g} text-black font-bold rounded-xl text-sm`}>Get started</button>
+              [`$${price}`, 'per hour, per machine'],
+              [`${freeMachines}`, `machine${freeMachines === 1 ? '' : 's'} free, always`],
+              ['4080 SUPER', 'dedicated passthrough'],
+              [nodesOnline === null ? '—' : String(nodesOnline), 'GPU nodes online now'],
+            ].map(([v, l]) => (
+              <div key={l}>
+                <div className="font-mono text-2xl font-black text-cyan-300 md:text-3xl">{v}</div>
+                <div className="mt-1.5 text-[11px] uppercase tracking-wider text-zinc-500">{l}</div>
               </div>
             ))}
           </div>
-          <p className="text-center text-[11px] text-zinc-600 mt-8">First machine free · up to 3 machines · $1/hour per billed machine · no subscription, no card on file</p>
-        </div>
-      </section>
+        </section>
 
-      {/* How it works */}
-      <section id="how" className="max-w-6xl mx-auto px-5 py-20">
-        <div className="text-center mb-12">
-          <h2 className="text-3xl font-black tracking-tight">Up and running in a minute</h2>
-        </div>
-        <div className="grid md:grid-cols-3 gap-8">
-          {[
-            [<Rocket className="w-6 h-6 text-cyan-400" />, '1 · Create an account', 'Username + password. No email, no KYC.'],
-            [<Bitcoin className="w-6 h-6 text-amber-400" />, '2 · Top up in Bitcoin', 'Pay $1–$24 via BTCPay. Balance credits instantly.'],
-            [<Monitor className="w-6 h-6 text-emerald-400" />, '3 · Deploy your machine', 'Spawn an Ubuntu session or deploy Windows/Linux. First one is free.'],
-          ].map(([ic, t, d], i) => (
-            <div key={i} className="text-center">
-              <div className="w-14 h-14 mx-auto rounded-2xl bg-zinc-900 border border-zinc-800 flex items-center justify-center mb-4">{ic}</div>
-              <div className="font-bold">{t}</div>
-              <div className="text-sm text-zinc-500 mt-2">{d}</div>
+        {/* ---- Hardware / products ---- */}
+        <section id="hardware" className="mx-auto max-w-6xl px-5 py-20 md:py-28">
+          <SectionHead
+            eyebrow="Three ways to compute"
+            title="One GPU, whichever interface you want"
+            sub="Every machine is a real isolated instance with the GPU attached — not a shared sandbox or a queued batch job."
+          />
+          <div className="grid gap-5 md:grid-cols-3">
+            <FeatureCard
+              icon={<Terminal className="w-6 h-6" aria-hidden="true" />} accent="emerald"
+              name="Ubuntu GPU Session" tag="In-browser · noVNC"
+              desc="A full Ubuntu desktop streamed to your browser with the RTX 4080 attached. Nothing to install locally — open a tab and you have a workstation."
+            />
+            <FeatureCard
+              icon={<Laptop className="w-6 h-6" aria-hidden="true" />} accent="cyan"
+              name="Windows 10" tag="RDP · full desktop"
+              desc="A real Windows 10 VM over RDP with administrator access. Games, GUI applications and CUDA workloads on a genuine desktop."
+            />
+            <FeatureCard
+              icon={<Server className="w-6 h-6" aria-hidden="true" />} accent="violet"
+              name="Linux" tag="SSH · headless"
+              desc="Debian over SSH with root. Docker, training runs and long-lived server jobs, without a desktop in the way."
+            />
+          </div>
+
+          <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {[
+              [<Cpu key="i" className="w-5 h-5 text-cyan-400" aria-hidden="true" />, 'Dedicated GPU', 'Real passthrough — the card is yours for the session'],
+              [<Shield key="i" className="w-5 h-5 text-emerald-400" aria-hidden="true" />, 'No KYC', 'Username, password, Bitcoin. Nothing else collected'],
+              [<Globe key="i" className="w-5 h-5 text-violet-400" aria-hidden="true" />, 'Clean egress', 'Sessions get a residential proxy when the pool has one'],
+              [<Lock key="i" className="w-5 h-5 text-amber-400" aria-hidden="true" />, 'Isolated', 'Your own VM with full root, destroyed on stop'],
+            ].map(([ic, t, d]) => (
+              <div key={String(t)} className="surface rounded-xl p-4">
+                <div className="flex items-center gap-2 text-sm font-semibold text-zinc-100">{ic}{t}</div>
+                <p className="mt-1.5 text-xs leading-relaxed text-zinc-500">{d}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* ---- Pricing ---- */}
+        <section id="pricing" className="border-t border-white/10 bg-white/[0.015]">
+          <div className="mx-auto max-w-6xl px-5 py-20 md:py-28">
+            <SectionHead
+              eyebrow="Pricing"
+              title="One price. No subscription."
+              sub={`$${price} per hour per billed machine, charged by the minute. Your first ${freeMachines} concurrent machine${freeMachines === 1 ? '' : 's'} cost${freeMachines === 1 ? 's' : ''} nothing.`}
+            />
+            <div className="mx-auto grid max-w-4xl gap-5 md:grid-cols-3">
+              {[
+                { usd: 1, label: 'Try it', desc: 'Enough for a quick render or a model test.', featured: false },
+                { usd: 5, label: 'A session', desc: 'The usual top-up for an afternoon of work.', featured: true },
+                { usd: 24, label: 'A full day', desc: 'Long training runs and overnight jobs.', featured: false },
+              ].map((t) => (
+                <div
+                  key={t.usd}
+                  className={cx(
+                    'surface relative flex flex-col rounded-2xl p-7 text-center',
+                    t.featured && 'border-cyan-400/40 shadow-[0_24px_60px_-40px_rgba(34,211,238,0.9)]',
+                  )}
+                >
+                  {t.featured && (
+                    <span className="absolute -top-2.5 left-1/2 -translate-x-1/2 rounded-full bg-cyan-400 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-ink-950">
+                      Most common
+                    </span>
+                  )}
+                  <div className="text-sm font-semibold text-zinc-400">{t.label}</div>
+                  <div className="my-3 font-mono text-4xl font-black text-zinc-50">${t.usd}</div>
+                  <div className="font-mono text-xs text-cyan-300">
+                    = {Math.round((t.usd / price) * 60)} minutes
+                  </div>
+                  <p className="mt-4 mb-7 flex-1 text-xs leading-relaxed text-zinc-500">{t.desc}</p>
+                  <button type="button" onClick={onLaunch} className={cx(t.featured ? BTN_PRIMARY : BTN_GHOST, 'mt-auto w-full py-3 text-sm')}>
+                    Get started
+                  </button>
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
-      </section>
-
-      {/* CTA */}
-      <section className="border-t border-zinc-800/70">
-        <div className="max-w-4xl mx-auto px-5 py-20 text-center">
-          <h2 className="text-3xl md:text-4xl font-black tracking-tight">Your GPU is waiting.</h2>
-          <p className="text-zinc-400 mt-4 max-w-xl mx-auto">Rent an RTX 4080 SUPER by the hour, paid in Bitcoin, no KYC. First machine free.</p>
-          <button onClick={onLaunch} className="flex items-center gap-2 mx-auto mt-8 px-8 py-4 bg-gradient-to-r from-cyan-500 to-emerald-500 text-black font-bold rounded-xl text-base hover:opacity-90 transition shadow-lg shadow-cyan-500/25">
-            Launch the console <ArrowRight className="w-4 h-4" />
-          </button>
-        </div>
-      </section>
-
-      {/* Footer */}
-      <footer className="border-t border-zinc-800/70 bg-zinc-950/60">
-        <div className="max-w-6xl mx-auto px-5 py-10 flex flex-col md:flex-row items-center justify-between gap-4">
-          <div className="flex items-center gap-2 font-black text-white">
-            <Cpu className="w-5 h-5 text-cyan-400" /> VORTEX<span className="text-cyan-400">GPU</span>
+            <p className="mt-8 text-center text-xs text-zinc-600">
+              Balance is spent one minute per billed machine per minute. At zero, machines stop automatically —
+              you can never overdraw. Up to {maxMachines} concurrent machines per account.
+            </p>
           </div>
-          <div className="text-xs text-zinc-600 text-center">
-            $1/hr · Bitcoin via BTCPay · No KYC · <a href="https://buymeacoffee.com/r26xrthzttg" className="text-zinc-500 hover:text-zinc-300">Support the build</a>
+        </section>
+
+        {/* ---- How it works ---- */}
+        <section id="how" className="mx-auto max-w-6xl px-5 py-20 md:py-28">
+          <SectionHead eyebrow="How it works" title="Running in about a minute" sub="" />
+          <ol className="grid list-none gap-8 p-0 md:grid-cols-3">
+            {[
+              [<Rocket key="i" className="w-5 h-5 text-cyan-400" aria-hidden="true" />, 'Create an account', 'Pick a username and a password. No email, no verification, no KYC.'],
+              [<Bitcoin key="i" className="w-5 h-5 text-amber-400" aria-hidden="true" />, 'Top up in Bitcoin', 'BTCPay generates an invoice; your balance credits the moment payment confirms.'],
+              [<Monitor key="i" className="w-5 h-5 text-emerald-400" aria-hidden="true" />, 'Deploy your machine', 'Spawn an Ubuntu GPU session or a Windows/Linux VM and connect straight away.'],
+            ].map(([ic, t, d], i) => (
+              <li key={String(t)} className="relative">
+                <div className="mb-4 flex items-center gap-3">
+                  <span className="flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-white/5">{ic}</span>
+                  <span className="font-mono text-xs text-zinc-600">STEP {i + 1}</span>
+                </div>
+                <h3 className="font-semibold text-zinc-100">{t}</h3>
+                <p className="mt-2 text-sm leading-relaxed text-zinc-500">{d}</p>
+              </li>
+            ))}
+          </ol>
+        </section>
+
+        {/* ---- FAQ ---- */}
+        <section id="faq" className="border-t border-white/10 bg-white/[0.015]">
+          <div className="mx-auto max-w-3xl px-5 py-20 md:py-28">
+            <SectionHead eyebrow="FAQ" title="Questions people actually ask" sub="" />
+            <div className="space-y-3">
+              {[
+                ['Is the first machine really free?', `Yes. Your first ${freeMachines} concurrent machine${freeMachines === 1 ? '' : 's'} ${freeMachines === 1 ? 'is' : 'are'} never billed. Only machines beyond that allowance draw down your balance.`],
+                ['What happens when my balance runs out?', 'Billed machines are stopped automatically at zero. You are never charged more than you have topped up, and there is no card on file to overdraw.'],
+                ['Do I need to install anything?', 'No. An Ubuntu GPU session runs entirely in the browser over noVNC. Windows and Linux VMs use your own RDP or SSH client.'],
+                ['What data do you collect?', 'A username, a password hash, and your balance. There is no email field, so there is also no password recovery — store your password somewhere safe.'],
+                ['How is payment handled?', 'Through a self-hosted BTCPay Server. You pay a Bitcoin invoice; a signed webhook credits your balance. No third-party payment processor sees you.'],
+              ].map(([q, a]) => (
+                <details key={q} className="surface group rounded-xl px-5 py-4">
+                  <summary className="flex cursor-pointer list-none items-center justify-between gap-4 font-semibold text-zinc-100">
+                    {q}
+                    <ChevronRight className="w-4 h-4 shrink-0 text-zinc-500 transition-transform group-open:rotate-90" aria-hidden="true" />
+                  </summary>
+                  <p className="mt-3 text-sm leading-relaxed text-zinc-400">{a}</p>
+                </details>
+              ))}
+            </div>
           </div>
+        </section>
+
+        {/* ---- CTA ---- */}
+        <section className="relative overflow-hidden border-t border-white/10">
+          <div className="pointer-events-none absolute inset-0 bg-aurora" aria-hidden="true" />
+          <div className="relative mx-auto max-w-3xl px-5 py-20 text-center md:py-28">
+            <h2 className="text-h2 font-black">Your GPU is idle right now.</h2>
+            <p className="mx-auto mt-4 max-w-xl text-zinc-400">
+              Spin up an RTX 4080 SUPER in the time it takes to read this. First machine free — you can try it before
+              you pay anything at all.
+            </p>
+            <button type="button" onClick={onLaunch} className={cx(BTN_PRIMARY, 'mx-auto mt-9 px-8 py-4 text-base')}>
+              Launch the console <ArrowRight className="w-4 h-4" aria-hidden="true" />
+            </button>
+          </div>
+        </section>
+      </main>
+
+      <footer className="border-t border-white/10">
+        <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-5 py-10 md:flex-row">
+          <Logo />
+          <p className="text-center text-xs text-zinc-600">
+            ${price}/hr · Bitcoin via BTCPay · No KYC ·{' '}
+            <a href="https://buymeacoffee.com/r26xrthzttg" target="_blank" rel="noopener noreferrer" className="text-zinc-500 underline-offset-2 hover:text-zinc-300 hover:underline">
+              Support the build
+            </a>
+          </p>
         </div>
       </footer>
     </div>
   );
 }
 
-function FeatureCard({ icon, name, tag, desc }: { icon: React.ReactNode; name: string; tag: string; desc: string }) {
+/** Live capacity indicator — reflects /api/health, not a decorative fake. */
+function StatusPill({ nodesOnline }: { nodesOnline: number | null }) {
+  if (nodesOnline === null) {
+    return (
+      <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-[11px] uppercase tracking-[0.18em] text-zinc-500">
+        <Activity className="w-3.5 h-3.5" aria-hidden="true" /> Checking capacity…
+      </span>
+    );
+  }
+  const up = nodesOnline > 0;
   return (
-    <div className="bg-zinc-900/40 border border-zinc-800 rounded-2xl p-6 hover:border-cyan-500/40 transition-colors">
-      <div className="flex items-center gap-2 mb-1">{icon}<span className="font-bold">{name}</span></div>
-      <div className="text-[11px] text-cyan-400 mb-2">{tag}</div>
-      <p className="text-sm text-zinc-400 leading-relaxed">{desc}</p>
+    <span
+      className={cx(
+        'inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] uppercase tracking-[0.18em]',
+        up ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-300' : 'border-amber-400/30 bg-amber-400/10 text-amber-300',
+      )}
+    >
+      <span className={cx('h-1.5 w-1.5 rounded-full', up ? 'bg-emerald-400 animate-live' : 'bg-amber-400')} aria-hidden="true" />
+      {up ? `${nodesOnline} GPU node${nodesOnline === 1 ? '' : 's'} online` : 'GPU capacity offline'}
+    </span>
+  );
+}
+
+function SectionHead({ eyebrow, title, sub }: { eyebrow: string; title: string; sub: string }) {
+  return (
+    <div className="mb-12 text-center">
+      <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-cyan-400">{eyebrow}</p>
+      <h2 className="mt-3 text-h2 font-black">{title}</h2>
+      {sub && <p className="mx-auto mt-4 max-w-xl leading-relaxed text-zinc-400">{sub}</p>}
     </div>
   );
 }
 
-function AuthGate({ onAuthed, onBack }: { onAuthed: (a: { token: string; user: User }) => void; onBack: () => void }) {
-  const [mode, setMode] = useState<'login' | 'register'>('login');
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!username.trim() || !password) return;
-    setLoading(true); setError('');
-    try {
-      const path = mode === 'login' ? '/api/auth/login' : '/api/auth/register';
-      const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: username.trim(), password }) });
-      const d = await r.json();
-      if (r.ok) {
-        const a = { token: d.token, user: d.user };
-        localStorage.setItem('vortex_auth', JSON.stringify(a));
-        onAuthed(a);
-      } else setError(d.error || 'failed');
-    } catch { setError('network error'); } finally { setLoading(false); }
-  };
-
+function FeatureCard({
+  icon, name, tag, desc, accent,
+}: {
+  icon: React.ReactNode; name: string; tag: string; desc: string; accent: keyof typeof ACCENTS;
+}) {
+  const a = ACCENTS[accent];
   return (
-    <div className="min-h-screen bg-[#05070d] flex items-center justify-center p-6 font-sans">
-      <div className="w-full max-w-md">
-        <button onClick={onBack} className="mb-6 flex items-center gap-1.5 text-sm text-zinc-500 hover:text-white transition-colors">
-          <ArrowRight className="w-4 h-4 rotate-180" /> Back to home
-        </button>
-        <div className="text-center mb-8">
-          <div className="inline-flex items-center gap-2 text-3xl font-black tracking-tight text-white">
-            <span className="text-cyan-400">VORTEX</span>GPU
-          </div>
-          <p className="text-sm text-zinc-400 mt-2">Rent a real GPU PC by the hour. Ubuntu sessions, Windows RDP, Linux SSH.</p>
-        </div>
-
-        <div className="flex gap-2 mb-4">
-          <button onClick={() => { setMode('login'); setError(''); }} className={`flex-1 py-2 rounded-xl border text-sm font-bold ${mode === 'login' ? 'border-cyan-500 bg-cyan-500/10 text-cyan-300' : 'border-zinc-800 text-zinc-500'}`}>
-            <LogIn className="w-4 h-4 inline mr-1" /> Login
-          </button>
-          <button onClick={() => { setMode('register'); setError(''); }} className={`flex-1 py-2 rounded-xl border text-sm font-bold ${mode === 'register' ? 'border-emerald-500 bg-emerald-500/10 text-emerald-300' : 'border-zinc-800 text-zinc-500'}`}>
-            <UserPlus className="w-4 h-4 inline mr-1" /> Register
-          </button>
-        </div>
-
-        <form onSubmit={submit} className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-6 space-y-4 backdrop-blur">
-          <label className="block text-xs text-zinc-400">USERNAME:</label>
-          <input type="text" value={username} onChange={(e) => setUsername(e.target.value)} placeholder="your username" autoComplete="username" className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-cyan-300 text-sm outline-none focus:border-cyan-500" />
-          <label className="block text-xs text-zinc-400">PASSWORD:</label>
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={mode === 'register' ? 'min 6 characters' : 'your password'} autoComplete={mode === 'login' ? 'current-password' : 'new-password'} className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-cyan-300 text-sm outline-none focus:border-cyan-500" />
-          {error && <p className="text-xs text-red-400">{error}</p>}
-          <button disabled={loading} className="w-full py-3 bg-gradient-to-r from-cyan-500 to-blue-600 text-black font-bold rounded-xl text-sm disabled:opacity-50">
-            {loading ? 'Please wait...' : mode === 'login' ? 'Sign In' : 'Create Account'}
-          </button>
-        </form>
-        <p className="text-[11px] text-zinc-600 text-center mt-4">$1.00 / hour · 1st machine free · up to 3 machines · Bitcoin via BTCPay</p>
+    <div className={cx('surface surface-hover rounded-2xl p-6', a.ring)}>
+      <div className={cx('mb-4 flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-white/5', a.text)}>
+        {icon}
       </div>
+      <h3 className="font-semibold text-zinc-100">{name}</h3>
+      <p className={cx('mt-0.5 text-[11px] font-medium uppercase tracking-wider', a.text)}>{tag}</p>
+      <p className="mt-3 text-sm leading-relaxed text-zinc-400">{desc}</p>
     </div>
   );
 }
-
-export default App;
