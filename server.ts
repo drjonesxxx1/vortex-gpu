@@ -250,19 +250,38 @@ function nodeAuthorized(req: express.Request) { return req.headers["x-node-secre
 function adminAuthorized(req: express.Request) { return (req.headers["authorization"] || "") === `Bearer ${ADMIN_TOKEN}`; }
 
 // ---- User auth tokens (in-memory; issued on login/register) ----
-const AUTH_TOKENS = new Map<string, string>(); // token -> userId
+// Deliberately NOT persisted: the only durable store here is the live customer
+// SQLite file, and a restart-surviving bearer table is not worth the extra write
+// path / revocation surface. Consequence (unchanged from before): a process
+// restart logs everyone out. What IS new is a hard expiry, so a leaked or
+// scraped token stops being valid forever.
+const TOKEN_TTL_MS = Math.max(60_000, num(process.env.AUTH_TOKEN_TTL_MS, 7 * 24 * 60 * 60 * 1000));
+type AuthToken = { userId: string; expiresAt: number };
+const AUTH_TOKENS = new Map<string, AuthToken>(); // token -> {userId, expiresAt}
+
 function issueToken(userId: string): string {
-  const token = crypto.randomBytes(24).toString("hex");
-  AUTH_TOKENS.set(token, userId);
+  const token = crypto.randomBytes(32).toString("hex");
+  AUTH_TOKENS.set(token, { userId, expiresAt: Date.now() + TOKEN_TTL_MS });
   return token;
 }
+function resolveToken(token: string): string | null {
+  const entry = token ? AUTH_TOKENS.get(token) : undefined;
+  if (!entry) return null;
+  if (Date.now() >= entry.expiresAt) { AUTH_TOKENS.delete(token); return null; }
+  return entry.userId;
+}
+// Sweep expired entries so the map cannot grow without bound.
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, e] of AUTH_TOKENS) if (now >= e.expiresAt) AUTH_TOKENS.delete(t);
+}, 10 * 60_000);
+
 function tokenFromReq(req: express.Request): string {
   const auth = String(req.headers["authorization"] || "");
   return auth.startsWith("Bearer ") ? auth.slice(7) : String(req.headers["x-auth-token"] || "");
 }
 function userFromReq(req: express.Request): any | null {
-  const token = tokenFromReq(req);
-  const userId = token ? AUTH_TOKENS.get(token) : undefined;
+  const userId = resolveToken(tokenFromReq(req));
   if (!userId) return null;
   return one<any>("SELECT * FROM users WHERE id=?", userId) || null;
 }
