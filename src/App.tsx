@@ -81,11 +81,19 @@ function fmtBalance(minutes: number): string {
   return h > 0 ? `${h}h ${m % 60}m` : `${m}m`;
 }
 
-/** Server errors are `{ error }` JSON, but a proxy hiccup can return HTML. */
+/** Server errors are `{ error }` JSON, but a proxy hiccup can return HTML.
+ *  Rate-limited replies also carry `retryAfterSec`; "slow down" with no
+ *  duration attached just leaves people refreshing blindly. */
 async function readError(r: Response, fallback: string): Promise<string> {
   try {
     const d = await r.json();
-    if (d && typeof d.error === 'string' && d.error) return d.error;
+    if (d && typeof d.error === 'string' && d.error) {
+      const wait = Number(d.retryAfterSec);
+      if (r.status === 429 && Number.isFinite(wait) && wait > 0) {
+        return `${d.error} — try again in ${wait < 90 ? `${Math.ceil(wait)}s` : `${Math.ceil(wait / 60)} min`}.`;
+      }
+      return d.error;
+    }
   } catch { /* not JSON */ }
   return `${fallback} (HTTP ${r.status})`;
 }
