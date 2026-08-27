@@ -149,6 +149,7 @@ function one<T>(sql: string, ...p: (string | number)[]): T | undefined { return 
 function all<T>(sql: string, ...p: (string | number)[]): T[] { return db.prepare(sql).all(...p) as T[]; }
 
 // ---- Password hashing (scrypt) ----
+const MAX_PASSWORD_LEN = 200;
 function hashPassword(pw: string): string {
   const salt = crypto.randomBytes(16).toString("hex");
   const hash = crypto.scryptSync(pw, salt, 32).toString("hex");
@@ -396,6 +397,7 @@ async function startServer() {
     if (!username) return res.status(400).json({ error: "username required" });
     if (!/^[a-zA-Z0-9_.-]{3,32}$/.test(username)) return res.status(400).json({ error: "username must be 3-32 chars (letters, numbers, _ . -)" });
     if (password.length < 6) return res.status(400).json({ error: "password must be at least 6 chars" });
+    if (password.length > MAX_PASSWORD_LEN) return res.status(400).json({ error: `password must be at most ${MAX_PASSWORD_LEN} chars` });
     if (one<any>("SELECT id FROM users WHERE username=?", username)) return res.status(409).json({ error: "username already taken" });
 
     const id = "usr_" + crypto.randomBytes(8).toString("hex");
@@ -406,15 +408,19 @@ async function startServer() {
   });
 
   app.post("/api/auth/login", (req, res) => {
-    const username = str(req.body?.username, "").trim();
+    const username = str(req.body?.username, "").slice(0, 64).trim();
     const password = str(req.body?.password, "");
+    // Bound scrypt work before doing any: an unbounded password is a cheap way to
+    // block the single-threaded event loop.
+    if (!username || password.length > MAX_PASSWORD_LEN) return res.status(400).json({ error: "invalid credentials" });
     const user = one<any>("SELECT * FROM users WHERE username=?", username);
     if (!user) return res.status(401).json({ error: "no account with that username" });
-    if (!user.password_hash) {
-      const h = hashPassword(password);
-      q("UPDATE users SET password_hash=? WHERE id=?", h, user.id);
-      user.password_hash = h;
-    }
+    // A NULL/blank password_hash is a legacy account with NO credential set. It
+    // must NOT be claimable: previously the first login silently adopted whatever
+    // password was submitted, handing the account to any attacker who guessed the
+    // username. Such accounts are locked out of this path until an operator sets
+    // a hash out-of-band.
+    if (!user.password_hash) return res.status(403).json({ error: "account has no password set — contact support" });
     if (!verifyPassword(password, user.password_hash)) return res.status(401).json({ error: "wrong password" });
     res.json({ token: issueToken(user.id), user: publicUser(user) });
   });
