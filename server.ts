@@ -247,8 +247,15 @@ function dispatchJob(hostname: string, kind: GpuJob["kind"], command: string, pa
 }
 
 // ---- auth helpers ----
-function nodeAuthorized(req: express.Request) { return req.headers["x-node-secret"] === NODE_SECRET; }
-function adminAuthorized(req: express.Request) { return (req.headers["authorization"] || "") === `Bearer ${ADMIN_TOKEN}`; }
+// Constant-time secret comparison — a plain `===` on a shared secret leaks its
+// prefix through response timing.
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+function nodeAuthorized(req: express.Request) { return safeEqual(String(req.headers["x-node-secret"] || ""), NODE_SECRET); }
+function adminAuthorized(req: express.Request) { return safeEqual(String(req.headers["authorization"] || ""), `Bearer ${ADMIN_TOKEN}`); }
 
 // ---- User auth tokens (in-memory; issued on login/register) ----
 // Deliberately NOT persisted: the only durable store here is the live customer
@@ -600,7 +607,10 @@ async function startServer() {
       return res.status(503).json({ error: "GPU node offline — try again shortly" });
     }
 
-    const instanceId = "sess_" + crypto.randomBytes(4).toString("hex");
+    // The /session/<instanceId>/ proxy is necessarily unauthenticated (noVNC
+    // loads it as a top-level iframe navigation with no Authorization header),
+    // so the instance id IS the capability. 4 bytes was guessable; use 16.
+    const instanceId = "sess_" + crypto.randomBytes(16).toString("hex");
     const port = allocateSessionPort();
     const password = "Ub" + crypto.randomBytes(6).toString("hex") + "!";
     const reso = str(resolution, "1440x900");
@@ -680,7 +690,7 @@ async function startServer() {
 
   // ===== ADMIN (hidden) =====
   app.get("/admin", (req, res) => {
-    if (req.query.token !== ADMIN_TOKEN) return res.status(404).send("Not found");
+    if (!safeEqual(str(req.query.token, ""), ADMIN_TOKEN)) return res.status(404).send("Not found");
     res.sendFile(path.join(process.cwd(), "dist", "admin.html"));
   });
 
@@ -823,7 +833,11 @@ ${opts.refreshSec ? `<div class="note">Retrying automatically every ${opts.refre
       const m = (req.url || "").match(/^\/session\/([^/]+)/);
       if (!m) return "http://127.0.0.1:1";
       const sess = one<any>("SELECT * FROM sessions WHERE instance_id=?", m[1]);
-      return sess ? `http://${sess.node_ip}:${sess.port}` : "http://127.0.0.1:1";
+      // The express state gate above does NOT run for WebSocket upgrades — those
+      // are handed straight to sessionProxy.upgrade by the http server and never
+      // traverse the express stack. Repeat the check here, otherwise a stopped,
+      // failed or still-provisioning session's websockify stays reachable.
+      return sess && sess.state === "running" ? `http://${sess.node_ip}:${sess.port}` : "http://127.0.0.1:1";
     },
     pathRewrite: (path) => path.replace(/^\/session\/[^/]+/, "") || "/",
     on: {
