@@ -100,6 +100,11 @@ function persistJobs() { saveJson(JOBS_FILE, jobs); }
 function num(v: unknown, fb: number): number { const n = Number(v); return Number.isFinite(n) ? n : fb; }
 function str(v: unknown, fb: string): string { return typeof v === "string" && v.length ? v : fb; }
 function normHost(v: unknown): string { return str(v, "").toLowerCase().trim(); }
+// Hostnames are used as keys into the `nodes` object. Restricting the charset
+// keeps "__proto__"/"constructor" out of that assignment as well as keeping the
+// registry readable.
+const HOSTNAME_RE = /^[a-z0-9][a-z0-9_.-]{0,62}$/;
+function validHost(h: string): boolean { return HOSTNAME_RE.test(h); }
 
 // ---- SQLite ----
 const db = new DatabaseSync(path.join(DATA_DIR, "vortex.db"));
@@ -242,9 +247,14 @@ function allocateSessionPort(): number {
 // Enqueue a GPU job for a node to pick up on its next poll.
 function dispatchJob(hostname: string, kind: GpuJob["kind"], command: string, payload: Record<string, unknown>): GpuJob {
   const job: GpuJob = { id: "job_" + crypto.randomBytes(6).toString("hex"), hostname, kind, command, payload, status: "pending", result: "", createdAt: Date.now(), completedAt: null };
-  jobs.push(job); persistJobs();
+  jobs.push(job); trimJobs(); persistJobs();
   return job;
 }
+
+// The jobs log is append-only in memory AND on disk. Keep it bounded (the admin
+// view only ever shows the last 50) so it cannot grow until the disk fills.
+const MAX_JOBS = 500;
+function trimJobs() { if (jobs.length > MAX_JOBS) jobs.splice(0, jobs.length - MAX_JOBS); }
 
 // ---- auth helpers ----
 // Constant-time secret comparison — a plain `===` on a shared secret leaks its
@@ -474,15 +484,19 @@ async function startServer() {
 
   // ===== VM PROVISIONING (real KVM clone) =====
   app.post("/api/vms/provision", async (req, res) => {
-    const { os, app } = req.body || {};
     const user = userFromReq(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
+    const osName = str(req.body?.os, "windows");
+    if (osName !== "windows" && osName !== "linux") return res.status(400).json({ error: "os must be 'windows' or 'linux'" });
+    // `app` is persisted and handed to node-side tooling; keep it to a safe charset.
+    const appName = str(req.body?.app, "").slice(0, 64);
+    if (appName && !/^[a-zA-Z0-9_. -]+$/.test(appName)) return res.status(400).json({ error: "invalid app" });
     const unlimited = !!user.unlimited;
     const active = countActive(user.id);
     if (!unlimited && active >= FREE_MACHINES && user.balance_minutes <= 0) return res.status(402).json({ error: "insufficient balance — your first machine is free; top up with Bitcoin for more" });
     if (!unlimited && active >= MAX_VMS_PER_USER) return res.status(429).json({ error: `limit reached — max ${MAX_VMS_PER_USER} machines per account` });
 
-    const isWin = (os || "windows") === "windows";
+    const isWin = osName === "windows";
     const template = isWin ? PVE_TEMPLATE_WIN : PVE_TEMPLATE_LINUX;
     const vmid = nextVmid() + Math.floor(Math.random() * 1000);
     const vmUid = "vm_" + crypto.randomBytes(6).toString("hex");
@@ -492,7 +506,7 @@ async function startServer() {
     const password = "Vx" + crypto.randomBytes(6).toString("hex") + "!";
 
     q("INSERT INTO vms (id,user_id,vm_id,node_hostname,name,os,sku,state,port,username,password,app,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-      vmUid, user.id, vmid, PVE_HOST, name, isWin ? "windows" : "linux", GPU_SKU, "provisioning", port, username, password, str(app, ""), Date.now());
+      vmUid, user.id, vmid, PVE_HOST, name, isWin ? "windows" : "linux", GPU_SKU, "provisioning", port, username, password, appName, Date.now());
 
     // clone + start (long-running; runs in background)
     cloneVm(template, vmid, name).then(async (r) => {
@@ -505,7 +519,7 @@ async function startServer() {
     res.json({
       vmId: vmUid, os: isWin ? "windows" : "linux", sku: GPU_SKU, state: "provisioning",
       access: isWin ? { protocol: "rdp", host: PVE_HOST, port, username, password } : { protocol: "ssh", host: PVE_HOST, port, username, password },
-      app: str(app, ""),
+      app: appName,
     });
   });
 
@@ -592,9 +606,13 @@ async function startServer() {
 
   // ===== UBUNTU GPU SESSIONS (spawn in-browser desktop with the 4080 attached) =====
   app.post("/api/session/spawn", (req, res) => {
-    const { resolution } = req.body || {};
     const user = userFromReq(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
+    // `resolution` is forwarded verbatim in the provision_ubuntu job payload and
+    // consumed by the node agent when it starts Xvfb/noVNC. Anything other than
+    // WxH must never reach that side.
+    const reso = str(req.body?.resolution, "1440x900");
+    if (!/^\d{3,5}x\d{3,5}$/.test(reso)) return res.status(400).json({ error: "resolution must look like 1440x900" });
     const unlimited = !!user.unlimited;
     const active = countActive(user.id);
     if (!unlimited && active >= FREE_MACHINES && user.balance_minutes <= 0) return res.status(402).json({ error: "insufficient balance — your first machine is free; top up with Bitcoin for more" });
@@ -613,7 +631,6 @@ async function startServer() {
     const instanceId = "sess_" + crypto.randomBytes(16).toString("hex");
     const port = allocateSessionPort();
     const password = "Ub" + crypto.randomBytes(6).toString("hex") + "!";
-    const reso = str(resolution, "1440x900");
     const id = "ses_" + crypto.randomBytes(8).toString("hex");
     const proxy = assignProxy(); // clean ProxyFly proxy, auto-assigned in background
 
@@ -644,7 +661,7 @@ async function startServer() {
   app.post("/api/node/register", (req, res) => {
     if (!nodeAuthorized(req)) return res.status(401).json({ error: "unauthorized" });
     const hostname = normHost(req.body?.hostname);
-    if (!hostname) return res.status(400).json({ error: "hostname required" });
+    if (!validHost(hostname)) return res.status(400).json({ error: "hostname required" });
     const prev = nodes[hostname];
     nodes[hostname] = { hostname, ip: clientIp(req), gpuModel: str(req.body?.gpuModel, prev?.gpuModel ?? "GPU"), driverVersion: str(req.body?.driverVersion, prev?.driverVersion ?? ""), memTotalMb: num(req.body?.memTotalMb, prev?.memTotalMb ?? 0), memUsedMb: prev?.memUsedMb ?? 0, gpuUtilPct: prev?.gpuUtilPct ?? 0, tempC: prev?.tempC ?? 0, cpuUtilPct: prev?.cpuUtilPct ?? 0, ramTotalGb: num(req.body?.ramTotalGb, prev?.ramTotalGb ?? 0), ramUsedGb: prev?.ramUsedGb ?? 0, uptimeSec: prev?.uptimeSec ?? 0, lastSeen: Date.now() };
     persistNodes();
@@ -654,7 +671,7 @@ async function startServer() {
   app.post("/api/node/report", (req, res) => {
     if (!nodeAuthorized(req)) return res.status(401).json({ error: "unauthorized" });
     const b = req.body || {}; const hostname = normHost(b.hostname);
-    if (!hostname) return res.status(400).json({ error: "hostname required" });
+    if (!validHost(hostname)) return res.status(400).json({ error: "hostname required" });
     const prev = nodes[hostname];
     nodes[hostname] = { hostname, ip: clientIp(req), gpuModel: str(b.gpuModel, prev?.gpuModel ?? "GPU"), driverVersion: str(b.driverVersion, prev?.driverVersion ?? ""), memTotalMb: num(b.memTotalMb, prev?.memTotalMb ?? 0), memUsedMb: num(b.memUsedMb, prev?.memUsedMb ?? 0), gpuUtilPct: num(b.gpuUtilPct, prev?.gpuUtilPct ?? 0), tempC: num(b.tempC, prev?.tempC ?? 0), cpuUtilPct: num(b.cpuUtilPct, prev?.cpuUtilPct ?? 0), ramTotalGb: num(b.ramTotalGb, prev?.ramTotalGb ?? 0), ramUsedGb: num(b.ramUsedGb, prev?.ramUsedGb ?? 0), uptimeSec: num(b.uptimeSec, prev?.uptimeSec ?? 0), lastSeen: Date.now() };
     persistNodes();
@@ -675,7 +692,7 @@ async function startServer() {
     const job = jobs.find((j) => j.id === req.params.id);
     if (!job) return res.status(404).json({ error: "not found" });
     job.status = req.body?.ok ? "done" : "failed";
-    job.result = String(req.body?.result ?? "");
+    job.result = String(req.body?.result ?? "").slice(0, 64 * 1024); // bound jobs.json growth
     job.completedAt = Date.now();
     // Reflect provisioning result onto the session row.
     const p = job.payload as any;
@@ -702,23 +719,39 @@ async function startServer() {
       vms: all<any>("SELECT * FROM vms ORDER BY created_at DESC"),
       users: all<any>("SELECT id,username,balance_minutes,unlimited,created_at FROM users ORDER BY created_at DESC"),
       invoices: all<any>("SELECT * FROM invoices ORDER BY created_at DESC LIMIT 50"),
+      // NOTE: `adminToken` was removed from this response. The caller must already
+      // hold ADMIN_TOKEN to reach this route, so echoing it back bought nothing and
+      // pushed the long-lived admin secret into browser memory, history, logs and
+      // any error/telemetry sink that captures API responses.
       proxyPool: proxyPool.slice(0, 20).map((p) => ({ ip: p.ip, location: p.location, latencyMs: p.latencyMs })),
-      adminToken: ADMIN_TOKEN,
     });
   });
 
   app.post("/api/admin/gpu/run", (req, res) => {
     if (!adminAuthorized(req)) return res.status(404).json({ error: "not found" });
-    const { hostname, command } = req.body || {};
+    // This endpoint is remote code execution on a GPU host by design. The gate is
+    // ADMIN_TOKEN (now compared in constant time); everything below just stops a
+    // malformed body from parking a non-string command in jobs.json forever.
+    const hostname = normHost(req.body?.hostname);
+    const command = str(req.body?.command, "");
     if (!hostname || !command) return res.status(400).json({ error: "hostname and command required" });
+    if (command.length > 4096) return res.status(400).json({ error: "command too long" });
+    if (!nodes[hostname]) return res.status(404).json({ error: "unknown node" });
+    console.warn(`[admin] shell job dispatched to ${hostname} from ${clientIp(req)}`);
     const job: GpuJob = { id: "job_" + crypto.randomBytes(6).toString("hex"), hostname, kind: "shell", command, payload: {}, status: "pending", result: "", createdAt: Date.now(), completedAt: null };
-    jobs.push(job); persistJobs();
+    jobs.push(job); trimJobs(); persistJobs();
     res.json({ ok: true, jobId: job.id });
   });
 
   app.post("/api/admin/credit", (req, res) => {
     if (!adminAuthorized(req)) return res.status(404).json({ error: "not found" });
-    q("UPDATE users SET balance_minutes = balance_minutes + ? WHERE id=?", num(req.body?.minutes, 0), str(req.body?.userId, ""));
+    const userId = str(req.body?.userId, "");
+    const minutes = Math.trunc(num(req.body?.minutes, 0));
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    // balance_minutes is an INTEGER column; a float or NaN here would corrupt it.
+    if (!Number.isSafeInteger(minutes) || Math.abs(minutes) > 10_000_000) return res.status(400).json({ error: "invalid minutes" });
+    if (!one<any>("SELECT id FROM users WHERE id=?", userId)) return res.status(404).json({ error: "user not found" });
+    q("UPDATE users SET balance_minutes = MAX(0, balance_minutes + ?) WHERE id=?", minutes, userId);
     res.json({ ok: true });
   });
 
