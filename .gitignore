@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+*.local
+data/*.db
+data/*.db-journal
+data/*.db-wal
+*.bak
+*.bak-*
+*.finbak
+src.bak.*
+data/*.json
+!data/.gitkeep
