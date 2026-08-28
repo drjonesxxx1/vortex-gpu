@@ -273,7 +273,7 @@ export function SettingsView({
             </Field>
             <div className="rounded-xl border border-white/10 bg-black/30 px-4 py-3 sm:col-span-2">
               <dt className="text-[10px] font-medium uppercase tracking-widest text-zinc-500">
-                Bitcoin deposit address
+                Bitcoin address
               </dt>
               <dd className="mt-2">
                 {btcAddress ? (
@@ -281,7 +281,7 @@ export function SettingsView({
                 ) : (
                   <p className="flex items-center gap-2 text-xs text-zinc-500">
                     <Bitcoin className="w-3.5 h-3.5 text-amber-400/70" aria-hidden="true" />
-                    No address assigned yet — one is created with your first invoice.
+                    No Bitcoin address on file for this account.
                   </p>
                 )}
               </dd>
@@ -377,7 +377,7 @@ export function SettingsView({
             {pwDone && (
               <div className="flex items-center gap-2 rounded-xl border border-emerald-400/40 bg-emerald-950/30 px-4 py-3 text-sm text-emerald-200">
                 <CheckCircle2 className="w-4 h-4 shrink-0" aria-hidden="true" />
-                Password changed. Other devices stay signed in until you log out everywhere.
+                Password changed. Every other device was signed out; this one stays signed in.
               </div>
             )}
           </div>
