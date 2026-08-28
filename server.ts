@@ -261,6 +261,45 @@ async function startVm(vmid: number): Promise<{ ok: boolean; out: string }> {
 async function stopVm(vmid: number): Promise<{ ok: boolean; out: string }> {
   return pve(["qm", "shutdown", String(vmid)]);
 }
+// Reclaim a guest and its disks when a tenant deletes their machine. Without
+// this, delete removed only the DB row and left a real KVM guest (up to 250GB
+// for a Windows clone) stranded on the host forever -- untracked and unbilled.
+async function reclaimVm(vmid: number): Promise<{ ok: boolean; out: string }> {
+  return pve(["qm", "destroy", String(vmid), "--purge", "--skiplock"]);
+}
+
+// How often to re-read the host and correct drifted vm rows, and how old a row
+// must be before it is eligible (so a clone still in flight is never touched).
+const VM_RECONCILE_MS = Math.max(60_000, num(process.env.VM_RECONCILE_MS, 5 * 60_000));
+const VM_RECONCILE_MIN_AGE_MS = 15 * 60_000;
+
+// The vms table is only written when a request happens, so it drifts from the
+// host. Re-read `qm list` and correct the record. Conservative by design: only
+// ever UPDATEs `state`, never deletes a row, never changes anything on the host.
+async function reconcileVms(): Promise<void> {
+  const r = await pve(["qm", "list"]);
+  if (!r.ok) { console.warn("[reconcile] qm list failed; leaving vm states untouched"); return; }
+  const onHost = new Map<number, string>();
+  for (const line of r.out.split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+\S+\s+(\w+)/);
+    if (m) onHost.set(Number(m[1]), m[2].toLowerCase());
+  }
+  if (onHost.size === 0) { console.warn("[reconcile] no parseable guests; skipping"); return; }
+  const cutoff = Date.now() - VM_RECONCILE_MIN_AGE_MS;
+  const rows = all<any>("SELECT id, vm_id, state, created_at FROM vms WHERE state NOT IN ('provisioning','stopping')");
+  let fixed = 0;
+  for (const row of rows) {
+    if (Number(row.created_at) > cutoff) continue;
+    const hostState = onHost.get(Number(row.vm_id));
+    const want = hostState === undefined ? "failed" : hostState === "running" ? "running" : "stopped";
+    if (want !== String(row.state)) {
+      q("UPDATE vms SET state=? WHERE id=?", want, row.id);
+      console.log(`[reconcile] ${row.id} (vmid ${row.vm_id}): ${row.state} -> ${want}`);
+      fixed++;
+    }
+  }
+  if (fixed) console.log(`[reconcile] corrected ${fixed} vm row(s)`);
+}
 async function vmStatus(vmid: number): Promise<string> {
   const r = await pve(["qm", "status", String(vmid)]);
   const m = r.out.match(/status:\s*(\w+)/);
@@ -725,7 +764,7 @@ async function startServer() {
   // resource forever, so only rows that are already terminal — 'stopped' or
   // 'failed' — may go. Anything still live or mid-transition is refused.
   const DELETABLE_STATES = ["stopped", "failed"];
-  app.post("/api/vms/delete", (req, res) => {
+  app.post("/api/vms/delete", async (req, res) => {
     const user = userFromReq(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
     const vmId = str(req.body?.vmId, "");
@@ -733,9 +772,19 @@ async function startServer() {
     const vm = one<any>("SELECT * FROM vms WHERE id=? AND user_id=?", vmId, user.id);
     if (!vm) return res.status(404).json({ error: "not found" });
     if (!DELETABLE_STATES.includes(String(vm.state))) return res.status(409).json({ error: "stop the machine first" });
+    // Reclaim the guest BEFORE dropping the row. If the row went first and the
+    // reclaim failed, the guest would be stranded with nothing left to retry
+    // from. A guest that is already gone counts as success, which is also what
+    // heals rows whose guest was removed by hand.
+    const rec = await reclaimVm(vm.vm_id);
+    if (!rec.ok && !/does not exist|no such/i.test(rec.out)) {
+      console.error(`[vms] reclaim of vmid ${vm.vm_id} failed, keeping row ${vm.id}: ${rec.out.slice(0, 200)}`);
+      return res.status(502).json({ error: "could not reclaim the machine on the host — nothing was deleted; try again shortly" });
+    }
     // The state predicate is repeated in the DELETE (belt and braces), and
     // user_id is repeated so this can never reach another account's row.
     q("DELETE FROM vms WHERE id=? AND user_id=? AND state IN ('stopped','failed')", vm.id, user.id);
+    console.log(`[vms] reclaimed vmid ${vm.vm_id} and removed row ${vm.id}`);
     res.json({ ok: true });
   });
 
@@ -1186,6 +1235,12 @@ ${opts.refreshSec ? `<div class="note">Retrying automatically every ${opts.refre
   // Kick the ProxyFly pool refresher (background auto-assign of clean proxies).
   refreshProxyPool();
   setInterval(refreshProxyPool, 5 * 60_000);
+
+  // Keep vm rows honest against the host. A reconcile failure must never take
+  // the gateway down, so errors are logged and swallowed.
+  const runReconcile = () => reconcileVms().catch((e) => console.warn("[reconcile] pass failed:", e?.message));
+  runReconcile();
+  setInterval(runReconcile, VM_RECONCILE_MS);
 
   const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`[VortexGPU] rent-a-PC gateway on :${PORT}`);
