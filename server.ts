@@ -54,6 +54,9 @@ const MAX_INVOICE_CENTS = 1_000_000; // $10,000 ceiling on a single top-up
 // cannot run anything on the GPU — while still billing them. Refuse instead.
 // Set to 0 to disable the preflight.
 const MIN_FREE_VRAM_MB = Number.isFinite(Number(process.env.MIN_FREE_VRAM_MB)) ? Number(process.env.MIN_FREE_VRAM_MB) : 2048;
+// The only node running the Linux docker/noVNC session agent. Health and spawn
+// MUST agree on this, or health advertises capacity sessions cannot use.
+const SESSION_NODE = process.env.SESSION_NODE || "nightmare";
 const MAX_VMS_PER_USER = 3;
 const FREE_MACHINES = Number(process.env.FREE_MACHINES) || 1; // 1st machine free, 2nd+ billed
 
@@ -458,13 +461,18 @@ async function startServer() {
   // ===== PUBLIC =====
   app.get("/api/health", (_req, res) => {
     const online = Object.values(nodes).filter((n) => Date.now() - n.lastSeen < 30_000);
+    const sessionNode = nodes[SESSION_NODE];
     res.json({
       status: "ok", node: "VortexGPU",
       gpuNodesOnline: online.length, gpuNodesTotal: Object.keys(nodes).length,
       // Real capacity, so the UI can show what is actually available rather than
       // implying the full card is free.
-      gpuVramFreeMb: online.reduce((m, n) => Math.max(m, Math.max(0, (n.memTotalMb || 0) - (n.memUsedMb || 0))), 0),
-      gpuVramTotalMb: online.reduce((m, n) => Math.max(m, n.memTotalMb || 0), 0),
+      // Report the SESSION node specifically. Aggregating across the fleet
+      // advertised a Windows node's headroom for a Linux-only capability.
+      sessionNode: SESSION_NODE,
+      sessionNodeOnline: !!sessionNode && Date.now() - sessionNode.lastSeen < 30_000,
+      gpuVramFreeMb: sessionNode ? Math.max(0, (sessionNode.memTotalMb || 0) - (sessionNode.memUsedMb || 0)) : 0,
+      gpuVramTotalMb: sessionNode ? (sessionNode.memTotalMb || 0) : 0,
       minFreeVramMb: MIN_FREE_VRAM_MB,
       gpuSku: GPU_SKU, priceUsdPerHour: PRICE_USD_PER_HOUR, maxVmsPerUser: MAX_VMS_PER_USER,
       freeMachines: FREE_MACHINES,
@@ -761,7 +769,7 @@ async function startServer() {
     if (!unlimited && active >= MAX_VMS_PER_USER) return res.status(429).json({ error: `limit reached — max ${MAX_VMS_PER_USER} machines per account` });
 
     // Target the Linux GPU node (nightmare) that runs the Ubuntu-session agent.
-    const hostname = "nightmare";
+    const hostname = SESSION_NODE;
     const node = nodes[hostname];
     if (!node || Date.now() - node.lastSeen > 30_000) {
       return res.status(503).json({ error: "GPU node offline — try again shortly" });
