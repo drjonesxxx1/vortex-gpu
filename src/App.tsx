@@ -1,11 +1,15 @@
 import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  Activity, AlertTriangle, ArrowRight, Bitcoin, CheckCircle2, ChevronRight, Clock,
-  Copy, Cpu, ExternalLink, Eye, EyeOff, Globe, KeyRound, Laptop, Loader2, Lock,
+  Activity, ArrowRight, Bitcoin, CheckCircle2, ChevronRight, Clock,
+  Cpu, ExternalLink, Eye, EyeOff, Globe, KeyRound, Laptop, Lock,
   LogIn, LogOut, Menu, Monitor, Power, Rocket, Server, Shield, Terminal,
   UserPlus, Wallet, X, Zap,
 } from 'lucide-react';
+import {
+  Alert, BTN_AMBER, BTN_BASE, BTN_GHOST, BTN_PRIMARY, CopyField,
+  INPUT_CLS, Spinner, StateBadge, cx, fmtBalance, readError, useDialogChrome,
+} from './components/ui';
 import './index.css';
 
 /** three.js is ~460 kB of the bundle and the hero renders fine without it for a
@@ -75,38 +79,8 @@ function fmtUptime(createdAt: number, now: number): string {
   return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${ss}s` : `${ss}s`;
 }
 
-function fmtBalance(minutes: number): string {
-  const m = Math.max(0, Math.floor(minutes));
-  const h = Math.floor(m / 60);
-  return h > 0 ? `${h}h ${m % 60}m` : `${m}m`;
-}
-
-/** Server errors are `{ error }` JSON, but a proxy hiccup can return HTML.
- *  Rate-limited replies also carry `retryAfterSec`; "slow down" with no
- *  duration attached just leaves people refreshing blindly. */
-async function readError(r: Response, fallback: string): Promise<string> {
-  try {
-    const d = await r.json();
-    if (d && typeof d.error === 'string' && d.error) {
-      const wait = Number(d.retryAfterSec);
-      if (r.status === 429 && Number.isFinite(wait) && wait > 0) {
-        return `${d.error} — try again in ${wait < 90 ? `${Math.ceil(wait)}s` : `${Math.ceil(wait / 60)} min`}.`;
-      }
-      return d.error;
-    }
-  } catch { /* not JSON */ }
-  return `${fallback} (HTTP ${r.status})`;
-}
-
-const cx = (...parts: Array<string | false | null | undefined>) => parts.filter(Boolean).join(' ');
-
-/* Shared class recipes — one place to keep buttons consistent. */
-const BTN_BASE =
-  'inline-flex items-center justify-center gap-2 rounded-xl font-semibold transition-colors ' +
-  'disabled:opacity-45 disabled:cursor-not-allowed select-none';
-const BTN_PRIMARY = `${BTN_BASE} bg-cyan-400 text-ink-950 hover:bg-cyan-300 disabled:hover:bg-cyan-400`;
-const BTN_AMBER = `${BTN_BASE} bg-amber-400 text-ink-950 hover:bg-amber-300 disabled:hover:bg-amber-400`;
-const BTN_GHOST = `${BTN_BASE} border border-white/15 text-zinc-200 hover:border-cyan-400/50 hover:text-white`;
+/* Buttons, alerts, badges, copy fields, dialog chrome and the `{error}` reader
+ * all live in ./components/ui so the settings area speaks the same dialect. */
 
 /* ------------------------------------------------------------ small parts */
 
@@ -118,107 +92,6 @@ function Logo({ className = 'text-lg' }: { className?: string }) {
         VORTEX<span className="text-cyan-400">GPU</span>
       </span>
     </span>
-  );
-}
-
-function Spinner({ className = 'w-4 h-4' }: { className?: string }) {
-  return <Loader2 className={cx(className, 'animate-spin')} aria-hidden="true" />;
-}
-
-/** Inline, dismissible, announced to assistive tech. */
-function Alert({
-  tone = 'error', children, onDismiss, action,
-}: {
-  tone?: 'error' | 'warn' | 'info';
-  children: React.ReactNode;
-  onDismiss?: () => void;
-  action?: React.ReactNode;
-}) {
-  const tones = {
-    error: 'border-red-500/40 bg-red-950/40 text-red-200',
-    warn: 'border-amber-500/40 bg-amber-950/30 text-amber-200',
-    info: 'border-cyan-500/40 bg-cyan-950/30 text-cyan-100',
-  } as const;
-  return (
-    <div
-      role="alert"
-      className={cx('flex flex-wrap items-center gap-3 rounded-xl border px-4 py-3 text-sm', tones[tone])}
-    >
-      <AlertTriangle className="w-4 h-4 shrink-0" aria-hidden="true" />
-      <span className="flex-1 min-w-[12rem]">{children}</span>
-      {action}
-      {onDismiss && (
-        <button
-          type="button"
-          onClick={onDismiss}
-          aria-label="Dismiss message"
-          className="rounded-md p-1 hover:bg-white/10"
-        >
-          <X className="w-4 h-4" aria-hidden="true" />
-        </button>
-      )}
-    </div>
-  );
-}
-
-function StateBadge({ state }: { state: string }) {
-  const cls =
-    state === 'running' ? 'bg-emerald-400/15 text-emerald-300 ring-emerald-400/30'
-      : state === 'provisioning' ? 'bg-amber-400/15 text-amber-300 ring-amber-400/30'
-        : state === 'failed' ? 'bg-red-500/15 text-red-300 ring-red-500/30'
-          : 'bg-white/5 text-zinc-400 ring-white/10';
-  return (
-    <span className={cx('rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ring-1', cls)}>
-      {state}
-    </span>
-  );
-}
-
-function CopyField({ label, value, secret = false }: { label: string; value: string; secret?: boolean }) {
-  const [copied, setCopied] = useState(false);
-  const [shown, setShown] = useState(!secret);
-  const timer = useRef<number | undefined>(undefined);
-  useEffect(() => () => window.clearTimeout(timer.current), []);
-
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-      window.clearTimeout(timer.current);
-      timer.current = window.setTimeout(() => setCopied(false), 1600);
-    } catch {
-      setCopied(false);
-    }
-  };
-
-  return (
-    <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/40 px-2.5 py-1.5 font-mono text-[11px]">
-      <KeyRound className="w-3.5 h-3.5 shrink-0 text-zinc-500" aria-hidden="true" />
-      <span className="text-zinc-500">{label}</span>
-      <span className={cx('flex-1 truncate select-all', shown ? 'text-amber-300' : 'text-zinc-600')}>
-        {shown ? value : '•'.repeat(Math.min(16, value.length))}
-      </span>
-      {secret && (
-        <button
-          type="button"
-          onClick={() => setShown((v) => !v)}
-          aria-label={shown ? `Hide ${label}` : `Show ${label}`}
-          className="shrink-0 rounded p-0.5 text-zinc-400 hover:text-white"
-        >
-          {shown ? <EyeOff className="w-3.5 h-3.5" aria-hidden="true" /> : <Eye className="w-3.5 h-3.5" aria-hidden="true" />}
-        </button>
-      )}
-      <button
-        type="button"
-        onClick={copy}
-        aria-label={`Copy ${label}`}
-        className="flex shrink-0 items-center gap-1 rounded px-1 font-bold text-cyan-400 hover:text-cyan-300"
-      >
-        {copied
-          ? <><CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" /> Copied</>
-          : <><Copy className="w-3.5 h-3.5" aria-hidden="true" /> Copy</>}
-      </button>
-    </div>
   );
 }
 
@@ -910,31 +783,7 @@ function PayModal({
   const baseline = useRef(currentMinutes);
 
   // Escape to close + focus trapped inside the dialog.
-  useEffect(() => {
-    const prev = document.activeElement as HTMLElement | null;
-    dialogRef.current?.querySelector<HTMLElement>('button, [href], input')?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { e.stopPropagation(); onClose(); return; }
-      if (e.key !== 'Tab' || !dialogRef.current) return;
-      const all: HTMLElement[] = [];
-      dialogRef.current
-        .querySelectorAll<HTMLElement>('button, [href], input, [tabindex]:not([tabindex="-1"])')
-        .forEach((n) => all.push(n));
-      const nodes = all.filter((n) => !n.hasAttribute('disabled'));
-      if (!nodes.length) return;
-      const first = nodes[0], last = nodes[nodes.length - 1];
-      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
-      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
-    };
-    document.addEventListener('keydown', onKey, true);
-    const overflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.removeEventListener('keydown', onKey, true);
-      document.body.style.overflow = overflow;
-      prev?.focus?.();
-    };
-  }, [onClose]);
+  useDialogChrome(dialogRef, onClose);
 
   const create = async () => {
     setLoading(true);
@@ -1152,10 +1001,6 @@ function AuthGate({ onAuthed, onBack }: { onAuthed: (a: Auth) => void; onBack: (
     }
   };
 
-  const inputCls =
-    'w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-sm text-zinc-100 ' +
-    'placeholder:text-zinc-600 outline-none focus:border-cyan-400';
-
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden px-5 py-12">
       <div className="pointer-events-none absolute inset-0 bg-aurora" aria-hidden="true" />
@@ -1219,7 +1064,7 @@ function AuthGate({ onAuthed, onBack }: { onAuthed: (a: Auth) => void; onBack: (
               spellCheck={false}
               required
               aria-describedby="username-hint"
-              className={inputCls}
+              className={INPUT_CLS}
             />
             <p id="username-hint" className={cx('mt-1.5 text-[11px]', mode === 'register' && username && !usernameOk ? 'text-amber-400' : 'text-zinc-600')}>
               3–32 characters: letters, numbers, and <span className="font-mono">_ . -</span>
@@ -1241,7 +1086,7 @@ function AuthGate({ onAuthed, onBack }: { onAuthed: (a: Auth) => void; onBack: (
                 autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
                 required
                 aria-describedby="password-hint"
-                className={cx(inputCls, 'pr-12')}
+                className={cx(INPUT_CLS, 'pr-12')}
               />
               <button
                 type="button"
