@@ -624,6 +624,25 @@ async function startServer() {
     res.json({ ok: true });
   });
 
+  // Permanently forget a VM row. Deleting a row whose Proxmox VM is still alive
+  // would orphan the guest (nothing left points at its VMID) and leak the host
+  // resource forever, so only rows that are already terminal — 'stopped' or
+  // 'failed' — may go. Anything still live or mid-transition is refused.
+  const DELETABLE_STATES = ["stopped", "failed"];
+  app.post("/api/vms/delete", (req, res) => {
+    const user = userFromReq(req);
+    if (!user) return res.status(401).json({ error: "not authenticated" });
+    const vmId = str(req.body?.vmId, "");
+    if (!vmId) return res.status(400).json({ error: "vmId required" });
+    const vm = one<any>("SELECT * FROM vms WHERE id=? AND user_id=?", vmId, user.id);
+    if (!vm) return res.status(404).json({ error: "not found" });
+    if (!DELETABLE_STATES.includes(String(vm.state))) return res.status(409).json({ error: "stop the machine first" });
+    // The state predicate is repeated in the DELETE (belt and braces), and
+    // user_id is repeated so this can never reach another account's row.
+    q("DELETE FROM vms WHERE id=? AND user_id=? AND state IN ('stopped','failed')", vm.id, user.id);
+    res.json({ ok: true });
+  });
+
   // ===== BTCPAY =====
   app.post("/api/btcpay/create-invoice",
     rateLimit("invoice", 20, 60 * 60_000, (req) => resolveToken(tokenFromReq(req)) || clientIp(req)),
@@ -745,6 +764,21 @@ async function startServer() {
     if (!sess) return res.status(404).json({ error: "not found" });
     q("UPDATE sessions SET state='stopping' WHERE id=?", sess.id);
     dispatchJob(sess.node_hostname, "destroy_ubuntu", "", { instanceId: sess.instance_id });
+    res.json({ ok: true });
+  });
+
+  // Same contract as /api/vms/delete: a live or provisioning session still has a
+  // container on a GPU node, and dropping the row is the only handle we have on
+  // it. Terminal rows only.
+  app.post("/api/session/delete", (req, res) => {
+    const user = userFromReq(req);
+    if (!user) return res.status(401).json({ error: "not authenticated" });
+    const sessionId = str(req.body?.sessionId, "");
+    if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+    const sess = one<any>("SELECT * FROM sessions WHERE id=? AND user_id=?", sessionId, user.id);
+    if (!sess) return res.status(404).json({ error: "not found" });
+    if (!DELETABLE_STATES.includes(String(sess.state))) return res.status(409).json({ error: "stop the machine first" });
+    q("DELETE FROM sessions WHERE id=? AND user_id=? AND state IN ('stopped','failed')", sess.id, user.id);
     res.json({ ok: true });
   });
 
