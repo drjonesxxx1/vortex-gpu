@@ -49,6 +49,11 @@ if (!WEBHOOK_SECRET) throw new Error("BTCPAY_WEBHOOK_SECRET is required; refusin
 const OWNER_SEED_PASSWORD = process.env.OWNER_SEED_PASSWORD || "";
 const PRICE_USD_PER_HOUR = 1.0;
 const MAX_INVOICE_CENTS = 1_000_000; // $10,000 ceiling on a single top-up
+// A tenant session is advertised as a GPU machine. Handing one out on a node
+// whose VRAM is already consumed by another workload gives them a desktop that
+// cannot run anything on the GPU — while still billing them. Refuse instead.
+// Set to 0 to disable the preflight.
+const MIN_FREE_VRAM_MB = Number.isFinite(Number(process.env.MIN_FREE_VRAM_MB)) ? Number(process.env.MIN_FREE_VRAM_MB) : 2048;
 const MAX_VMS_PER_USER = 3;
 const FREE_MACHINES = Number(process.env.FREE_MACHINES) || 1; // 1st machine free, 2nd+ billed
 
@@ -456,6 +461,11 @@ async function startServer() {
     res.json({
       status: "ok", node: "VortexGPU",
       gpuNodesOnline: online.length, gpuNodesTotal: Object.keys(nodes).length,
+      // Real capacity, so the UI can show what is actually available rather than
+      // implying the full card is free.
+      gpuVramFreeMb: online.reduce((m, n) => Math.max(m, Math.max(0, (n.memTotalMb || 0) - (n.memUsedMb || 0))), 0),
+      gpuVramTotalMb: online.reduce((m, n) => Math.max(m, n.memTotalMb || 0), 0),
+      minFreeVramMb: MIN_FREE_VRAM_MB,
       gpuSku: GPU_SKU, priceUsdPerHour: PRICE_USD_PER_HOUR, maxVmsPerUser: MAX_VMS_PER_USER,
       freeMachines: FREE_MACHINES,
       timestamp: new Date().toISOString(),
@@ -755,6 +765,11 @@ async function startServer() {
     const node = nodes[hostname];
     if (!node || Date.now() - node.lastSeen > 30_000) {
       return res.status(503).json({ error: "GPU node offline — try again shortly" });
+    }
+    // Capacity preflight against real nvidia-smi telemetry from the node.
+    const freeVramMb = Math.max(0, (node.memTotalMb || 0) - (node.memUsedMb || 0));
+    if (MIN_FREE_VRAM_MB > 0 && node.memTotalMb > 0 && freeVramMb < MIN_FREE_VRAM_MB) {
+      return res.status(503).json({ error: `GPU at capacity — ${freeVramMb} MiB VRAM free, ${MIN_FREE_VRAM_MB} MiB required. Nothing was charged; try again shortly.` });
     }
 
     // The /session/<instanceId>/ proxy is necessarily unauthenticated (noVNC
