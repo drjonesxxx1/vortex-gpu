@@ -1,4 +1,4 @@
-import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Activity, ArrowRight, Bitcoin, CheckCircle2, ChevronRight, Clock,
@@ -54,6 +54,16 @@ interface User { id: string; username: string; balance_minutes: number; unlimite
 interface Health {
   gpuNodesOnline: number; gpuNodesTotal: number; gpuSku: string;
   priceUsdPerHour: number; maxVmsPerUser: number; freeMachines: number;
+  /** The single Linux node that hosts Ubuntu GPU sessions, plus its real VRAM
+   *  headroom. That card is shared with another workload on the same box, so
+   *  free VRAM genuinely moves — these are polled values, not constants.
+   *  Optional because an older gateway may not send them yet; the UI then
+   *  degrades to "capacity unknown" rather than inventing a number. */
+  sessionNode?: string;
+  sessionNodeOnline?: boolean;
+  gpuVramFreeMb?: number;
+  gpuVramTotalMb?: number;
+  minFreeVramMb?: number;
 }
 
 interface Auth { token: string; user: User }
@@ -72,6 +82,86 @@ function desktopUrlFor(s: ApiSession): string {
     password: s.password,
   });
   return `/session/${s.instance_id}/static/vnc.html?${params.toString()}`;
+}
+
+/* ------------------------------------------------------------- capacity */
+
+/** MiB is the unit the gateway speaks, so every hard number stays MiB. Only the
+ *  headline reading is rounded to GiB, where a human actually reads it faster. */
+function fmtVram(mb: number): string {
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GiB` : `${Math.round(mb)} MiB`;
+}
+
+type CapacityState = 'unknown' | 'offline' | 'busy' | 'ready';
+
+interface Capacity {
+  state: CapacityState;
+  freeMb: number;
+  totalMb: number;
+  minMb: number;
+  /** Coarse state word. Changes only when the state changes, which makes it the
+   *  only part safe to put inside a live region on a polled value. */
+  status: string;
+  /** The moving number, rendered next to `status` but never announced. */
+  figure: string | null;
+  /** One sentence of context under the headline. */
+  detail: string;
+  /** Non-null when an Ubuntu GPU session cannot be spawned right now. This is
+   *  the same rule /api/session/spawn preflights, so the button is disabled
+   *  instead of dropping the user into a 503. */
+  sessionBlocked: string | null;
+}
+
+/**
+ * Reads capacity straight off /api/health. "Node offline" and "no VRAM to give"
+ * are deliberately different states — one means come back later, the other means
+ * the box that runs sessions is not reporting in at all.
+ */
+function readCapacity(h: Health | null): Capacity {
+  const freeMb = Number(h?.gpuVramFreeMb);
+  const totalMb = Number(h?.gpuVramTotalMb);
+  const minMb = Number(h?.minFreeVramMb);
+  const known =
+    !!h && typeof h.sessionNodeOnline === 'boolean' && Number.isFinite(freeMb) && Number.isFinite(minMb);
+  const base = {
+    freeMb: Number.isFinite(freeMb) ? freeMb : 0,
+    totalMb: Number.isFinite(totalMb) ? totalMb : 0,
+    minMb: Number.isFinite(minMb) ? minMb : 0,
+  };
+  const node = h?.sessionNode || 'the GPU node';
+
+  if (!known) {
+    return {
+      ...base, state: 'unknown',
+      status: 'Checking GPU capacity…', figure: null,
+      detail: 'Reading live VRAM from the session node.',
+      sessionBlocked: null,
+    };
+  }
+  if (!h!.sessionNodeOnline) {
+    return {
+      ...base, state: 'offline',
+      status: 'GPU node offline', figure: null,
+      detail: `${node} is not reporting in, so no new sessions can start.`,
+      sessionBlocked: `GPU node offline — ${node} is not reporting in`,
+    };
+  }
+  if (base.minMb > 0 && base.freeMb < base.minMb) {
+    return {
+      ...base, state: 'busy',
+      status: 'GPU busy', figure: `${Math.round(base.freeMb)} MiB free`,
+      detail: `Another workload holds the card. A session needs ${Math.round(base.minMb)} MiB free; this usually clears in a moment.`,
+      sessionBlocked: `GPU busy — ${Math.round(base.freeMb)} MiB free, needs ${Math.round(base.minMb)} MiB`,
+    };
+  }
+  return {
+    ...base, state: 'ready',
+    status: 'GPU online', figure: `${fmtVram(base.freeMb)} VRAM free`,
+    detail: base.totalMb > 0
+      ? `Free right now on ${node}, out of ${fmtVram(base.totalMb)} total. The card is shared, so this moves.`
+      : `Free right now on ${node}. The card is shared, so this moves.`,
+    sessionBlocked: null,
+  };
 }
 
 function fmtUptime(createdAt: number, now: number): string {
@@ -198,6 +288,7 @@ function Dashboard({
     maxMachines: 3,
     freeMachines: 1,
   });
+  const [health, setHealth] = useState<Health | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [connectionLost, setConnectionLost] = useState(false);
   const [error, setError] = useState('');
@@ -216,6 +307,13 @@ function Dashboard({
   signOutRef.current = onSignOut;
 
   const refresh = useCallback(async () => {
+    // Capacity rides the existing poll rather than adding a second timer. It is
+    // fired off alongside /api/me and never allowed to fail the account load:
+    // stale capacity is a disabled button, a stale account is a broken console.
+    const healthReq = fetch('/api/health')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (d) setHealth(d as Health); })
+      .catch(() => { /* capacity falls back to "unknown" */ });
     try {
       const r = await fetch('/api/me', { headers: { Authorization: `Bearer ${token}` } });
       if (r.status === 401) {
@@ -237,6 +335,8 @@ function Dashboard({
       setLoaded(true);
     } catch {
       setConnectionLost(true);
+    } finally {
+      await healthReq;
     }
   }, [token, setAuth]);
 
@@ -285,7 +385,15 @@ function Dashboard({
       setError('');
       try {
         const r = await post(path, body);
-        if (!r.ok) setError(await readError(r, fallbackMsg));
+        if (!r.ok) {
+          let msg = await readError(r, fallbackMsg);
+          // The VRAM preflight can still lose a race with the poll: capacity
+          // looked fine when the button rendered and was gone by the time the
+          // request landed. Surface the server's own text, and never leave any
+          // doubt about billing on a request that did nothing.
+          if (r.status === 503 && !/charg/i.test(msg)) msg += ' Nothing was charged.';
+          setError(msg);
+        }
         await refresh();
       } catch {
         setError('Network error — check your connection and try again.');
@@ -332,6 +440,11 @@ function Dashboard({
     : needsBalance
       ? 'Top up to deploy another machine'
       : null;
+
+  /** Ubuntu sessions are the only product the VRAM preflight guards, so the
+   *  Windows/Linux VM cards keep the account-level `blocked` rule alone. */
+  const capacity = readCapacity(health);
+  const sessionBlocked = blocked ?? capacity.sessionBlocked;
 
   return (
     <div className="min-h-screen bg-ink-950 text-zinc-100">
@@ -475,13 +588,7 @@ function Dashboard({
             </p>
           </div>
 
-          <div className="surface rounded-2xl p-5">
-            <div className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-zinc-500">
-              <Cpu className="w-3.5 h-3.5" aria-hidden="true" /> Hardware
-            </div>
-            <div className="mt-2 text-sm font-semibold leading-snug text-zinc-100">{meta.gpuSku}</div>
-            <p className="mt-1 text-xs text-zinc-500">Dedicated passthrough, not shared</p>
-          </div>
+          <GpuCapacityCard capacity={capacity} gpuSku={meta.gpuSku} />
         </section>
 
         {/* ---- Deploy ---- */}
@@ -502,8 +609,8 @@ function Dashboard({
               cta="Spawn session"
               onClick={spawnSession}
               busy={busy === 'session'}
-              disabled={!!busy || !!blocked}
-              blockedReason={blocked}
+              disabled={!!busy || !!sessionBlocked}
+              blockedReason={sessionBlocked}
               onBlockedAction={needsBalance && !atCap ? () => setPayOpen(true) : undefined}
             />
             <ProductCard
@@ -559,9 +666,15 @@ function Dashboard({
               <div className="mt-6 flex flex-wrap justify-center gap-3">
                 <button
                   type="button"
-                  onClick={spawnSession}
-                  disabled={!!busy || !!blocked}
-                  className={cx(BTN_PRIMARY, 'px-5 py-2.5 text-sm')}
+                  onClick={() => { if (!busy && !sessionBlocked) spawnSession(); }}
+                  aria-disabled={!!busy || !!sessionBlocked}
+                  aria-busy={busy === 'session'}
+                  aria-describedby={sessionBlocked ? 'empty-spawn-why' : undefined}
+                  title={sessionBlocked ?? undefined}
+                  className={cx(
+                    BTN_PRIMARY, 'px-5 py-2.5 text-sm',
+                    'aria-disabled:pointer-events-none aria-disabled:opacity-45',
+                  )}
                 >
                   {busy === 'session' ? <Spinner /> : <Terminal className="w-4 h-4" aria-hidden="true" />}
                   {busy === 'session' ? 'Starting…' : 'Spawn Ubuntu session'}
@@ -570,6 +683,9 @@ function Dashboard({
                   <Bitcoin className="w-4 h-4" aria-hidden="true" /> Buy minutes
                 </button>
               </div>
+              {sessionBlocked && (
+                <p id="empty-spawn-why" className="mt-4 text-xs text-amber-400">{sessionBlocked}</p>
+              )}
             </div>
           ) : (
             <ul className="grid list-none gap-4 p-0 md:grid-cols-2">
@@ -647,6 +763,52 @@ const ACCENTS = {
   violet: { text: 'text-violet-400', ring: 'hover:border-violet-400/40', btn: 'bg-violet-400 text-ink-950 hover:bg-violet-300' },
 } as const;
 
+/**
+ * Real VRAM headroom on the session node. The headline number moves with every
+ * poll, so it sits outside the live region — only `detail`, which changes when
+ * the *state* changes, is announced, otherwise assistive tech would read a new
+ * megabyte count every four seconds.
+ */
+function GpuCapacityCard({ capacity, gpuSku }: { capacity: Capacity; gpuSku: string }) {
+  const { state, freeMb, totalMb, minMb, detail } = capacity;
+  const tone =
+    state === 'ready' ? 'text-emerald-300'
+      : state === 'busy' ? 'text-amber-300'
+        : state === 'offline' ? 'text-red-300'
+          : 'text-zinc-500';
+  const bar =
+    state === 'ready' ? 'bg-emerald-400' : state === 'busy' ? 'bg-amber-400' : 'bg-zinc-600';
+  const pct = totalMb > 0 ? Math.min(100, Math.max(0, (freeMb / totalMb) * 100)) : 0;
+  const headline =
+    state === 'unknown' ? '—' : state === 'offline' ? 'Offline' : fmtVram(freeMb);
+
+  return (
+    <div className="surface rounded-2xl p-5">
+      <div className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-zinc-500">
+        <Cpu className="w-3.5 h-3.5" aria-hidden="true" /> GPU capacity
+      </div>
+      <div className={cx('mt-2 font-mono text-3xl font-bold leading-none', tone)}>
+        {headline}
+        {(state === 'ready' || state === 'busy') && (
+          <span className="ml-1 text-lg text-zinc-600">free</span>
+        )}
+      </div>
+
+      {totalMb > 0 && state !== 'offline' && (
+        <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/10" aria-hidden="true">
+          <div className={cx('h-full rounded-full transition-[width] duration-500', bar)} style={{ width: `${pct}%` }} />
+        </div>
+      )}
+
+      <p className="mt-2 text-xs leading-relaxed text-zinc-500" aria-live="polite">{detail}</p>
+      <p className="mt-1 truncate text-[11px] text-zinc-600" title={gpuSku}>
+        {gpuSku}
+        {minMb > 0 && state !== 'unknown' && ` · session needs ${Math.round(minMb)} MiB`}
+      </p>
+    </div>
+  );
+}
+
 function ProductCard({
   icon, name, tag, desc, cta, onClick, accent, busy, disabled, blockedReason, onBlockedAction,
 }: {
@@ -657,6 +819,13 @@ function ProductCard({
 }) {
   const a = ACCENTS[accent];
   const showTopUp = !!blockedReason && !!onBlockedAction;
+  /** A blocked control has to say why in a way a keyboard or screen-reader user
+   *  can actually reach. A natively `disabled` button drops out of the tab order
+   *  and takes its own description with it, so it is marked aria-disabled
+   *  instead: still focusable, still announced, but inert on click. */
+  const whyId = `why-${useId()}`;
+  const showWhy = !!blockedReason && !showTopUp;
+  const inert = disabled || busy;
   return (
     <div className={cx('surface surface-hover flex flex-col rounded-2xl p-5', a.ring)}>
       <div className={cx('mb-3 flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-white/5', a.text)}>
@@ -673,18 +842,24 @@ function ProductCard({
       ) : (
         <button
           type="button"
-          onClick={onClick}
-          disabled={disabled || busy}
+          onClick={() => { if (!inert) onClick(); }}
+          aria-disabled={inert}
           aria-busy={busy}
+          aria-describedby={showWhy ? whyId : undefined}
           title={blockedReason ?? undefined}
-          className={cx(BTN_BASE, a.btn, 'mt-5 w-full py-3 text-sm')}
+          className={cx(
+            BTN_BASE, a.btn, 'mt-5 w-full py-3 text-sm',
+            // pointer-events-none also kills the accent hover state, which would
+            // otherwise light up an inert button. Focus is unaffected.
+            'aria-disabled:pointer-events-none aria-disabled:opacity-45',
+          )}
         >
           {busy ? <><Spinner /> Starting…</> : <>{cta} <ArrowRight className="w-4 h-4" aria-hidden="true" /></>}
         </button>
       )}
 
-      {blockedReason && !showTopUp && (
-        <p className="mt-2 text-center text-[11px] text-amber-400">{blockedReason}</p>
+      {showWhy && (
+        <p id={whyId} className="mt-2 text-center text-[11px] leading-relaxed text-amber-400">{blockedReason}</p>
       )}
     </div>
   );
@@ -1270,7 +1445,7 @@ function LandingPage({ onLaunch }: { onLaunch: () => void }) {
   const freeMachines = health?.freeMachines ?? 1;
   const maxMachines = health?.maxVmsPerUser ?? 3;
   const gpuSku = health?.gpuSku ?? 'NVIDIA GeForce RTX 4080 SUPER 16GB';
-  const nodesOnline = health?.gpuNodesOnline ?? null;
+  const capacity = readCapacity(health);
 
   return (
     <div className="min-h-screen bg-ink-950 text-zinc-100">
@@ -1330,7 +1505,7 @@ function LandingPage({ onLaunch }: { onLaunch: () => void }) {
           <div className="pointer-events-none absolute inset-0 bg-grid" aria-hidden="true" />
           <div className="relative mx-auto grid max-w-6xl items-center gap-12 px-5 py-16 md:py-24 lg:grid-cols-2">
             <div className="animate-rise">
-              <StatusPill nodesOnline={nodesOnline} />
+              <StatusPill capacity={capacity} />
 
               <h1 className="mt-6 text-display font-black">
                 Rent a real GPU PC,{' '}
@@ -1394,13 +1569,30 @@ function LandingPage({ onLaunch }: { onLaunch: () => void }) {
               [`$${price}`, 'per hour, per machine'],
               [`${freeMachines}`, `machine${freeMachines === 1 ? '' : 's'} free, always`],
               ['4080 SUPER', 'dedicated passthrough'],
-              [nodesOnline === null ? '—' : String(nodesOnline), 'GPU nodes online now'],
             ].map(([v, l]) => (
               <div key={l}>
                 <div className="font-mono text-2xl font-black text-cyan-300 md:text-3xl">{v}</div>
                 <div className="mt-1.5 text-[11px] uppercase tracking-wider text-zinc-500">{l}</div>
               </div>
             ))}
+            {/* Live VRAM, not a fixed "16GB" — the card is shared, so the honest
+                number is what is free on the session node right now. The hero
+                pill owns the live announcement; this cell would only echo it. */}
+            <div>
+              <div
+                className={cx(
+                  'font-mono text-2xl font-black md:text-3xl',
+                  capacity.state === 'busy' ? 'text-amber-300'
+                    : capacity.state === 'offline' ? 'text-red-300'
+                      : 'text-cyan-300',
+                )}
+              >
+                {capacity.state === 'unknown' ? '—' : capacity.state === 'offline' ? 'Offline' : fmtVram(capacity.freeMb)}
+              </div>
+              <div className="mt-1.5 text-[11px] uppercase tracking-wider text-zinc-500">
+                {capacity.state === 'offline' ? 'session node offline' : 'GPU VRAM free right now'}
+              </div>
+            </div>
           </div>
         </section>
 
@@ -1565,25 +1757,46 @@ function LandingPage({ onLaunch }: { onLaunch: () => void }) {
   );
 }
 
-/** Live capacity indicator — reflects /api/health, not a decorative fake. */
-function StatusPill({ nodesOnline }: { nodesOnline: number | null }) {
-  if (nodesOnline === null) {
-    return (
-      <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-[11px] uppercase tracking-[0.18em] text-zinc-500">
-        <Activity className="w-3.5 h-3.5" aria-hidden="true" /> Checking capacity…
-      </span>
-    );
-  }
-  const up = nodesOnline > 0;
+/**
+ * Live capacity indicator — reflects /api/health, not a decorative fake. It
+ * reports free VRAM on the session node rather than a node count, because a
+ * node being up says nothing about whether a session can actually start on it.
+ */
+function StatusPill({ capacity }: { capacity: Capacity }) {
+  const skin = {
+    unknown: 'border-white/10 bg-white/5 text-zinc-500',
+    ready: 'border-emerald-400/30 bg-emerald-400/10 text-emerald-300',
+    busy: 'border-amber-400/30 bg-amber-400/10 text-amber-300',
+    offline: 'border-red-500/30 bg-red-500/10 text-red-300',
+  }[capacity.state];
+  const dot = {
+    unknown: 'bg-zinc-500',
+    ready: 'bg-emerald-400 animate-live',
+    busy: 'bg-amber-400',
+    offline: 'bg-red-400',
+  }[capacity.state];
+
   return (
+    // Polite, and keyed on a label that only changes when the *state* changes —
+    // announcing a fresh megabyte count on every poll would be unusable.
     <span
       className={cx(
-        'inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] uppercase tracking-[0.18em]',
-        up ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-300' : 'border-amber-400/30 bg-amber-400/10 text-amber-300',
+        'inline-flex max-w-full flex-wrap items-center gap-x-2 gap-y-1 rounded-full border px-3 py-1.5 text-[11px] uppercase tracking-[0.18em]',
+        skin,
       )}
     >
-      <span className={cx('h-1.5 w-1.5 rounded-full', up ? 'bg-emerald-400 animate-live' : 'bg-amber-400')} aria-hidden="true" />
-      {up ? `${nodesOnline} GPU node${nodesOnline === 1 ? '' : 's'} online` : 'GPU capacity offline'}
+      {capacity.state === 'unknown'
+        ? <Activity className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+        : <span className={cx('h-1.5 w-1.5 shrink-0 rounded-full', dot)} aria-hidden="true" />}
+      {/* Only the state word is live: the figure moves on every poll and would
+          otherwise be re-announced continuously. */}
+      <span aria-live="polite">{capacity.status}</span>
+      {capacity.figure && (
+        <>
+          <span aria-hidden="true" className="opacity-40">·</span>
+          <span className="tracking-normal opacity-90">{capacity.figure}</span>
+        </>
+      )}
     </span>
   );
 }
