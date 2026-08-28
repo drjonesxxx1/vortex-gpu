@@ -1,41 +1,82 @@
-# VortexGPU — Anonymous GPU Rental Platform (Production)
+# VortexGPU — GPU Rental Platform (Production)
 
-No-KYC, BTC-paid, browser-access GPU machines. Each tenant provisions a
-**completely isolated ComfyUI instance** on a shared physical GPU — they see a
-clean private machine and never know the GPU is time-shared.
+No-KYC, BTC-paid, browser-access GPU machines. Verified live 2026-08-28.
+
+> **Accuracy note:** this file documents what the code actually does. Earlier
+> revisions described a ComfyUI-only, load-balanced fleet; that was never what
+> `server.ts` implemented. Keep this in sync — it is read as a spec.
 
 ## Architecture
 
 ```
                         ┌──────────────────────────────────────────┐
-   Tenant browser ────► │  VortexGPU Gateway (CT 731, .127:3000)  │
+   Tenant browser ────► │  VortexGPU Gateway (CT 731, .127:3000)    │
                         │  Express + Vite SPA + SQLite              │
-                        │  • public SPA (login/provision/instances) │
+                        │  • public SPA (auth/deploy/settings)      │
                         │  • real BTCPay invoices + webhook settle  │
                         │  • hidden admin /admin?token=             │
+                        │  • /session/<id>/ noVNC reverse proxy     │
                         └───────────────┬──────────────────────────┘
                                         │ LAN (poll, X-NODE-SECRET)
-              ┌─────────────────────────┴─────────────────────────┐
-              ▼                                                     ▼
-   ┌────────────────────────┐                         ┌────────────────────────┐
-   │ shadow-death (.128)    │                         │ GamingPC (.186)        │
-   │ RTX 4080 SUPER 16GB    │                         │ RTX 3070               │
-   │ vortex-node-agent.ps1  │                         │ vortex-node-agent.ps1  │
-   │  → telemetry           │                         │  → telemetry           │
-   │  → provision_comfyui   │                         │  → provision_comfyui   │
-   │    (isolated port+dir) │                         │    (isolated port+dir) │
-   └────────────────────────┘                         └────────────────────────┘
+        ┌───────────────────────────────┼───────────────────────────────┐
+        ▼                               ▼                               ▼
+ ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+ │ nightmare (.128)     │  │ light_reaper (.186)  │  │ Proxmox (.85)        │
+ │ LINUX · RTX 4080S    │  │ WINDOWS · RTX 3070   │  │ KVM host             │
+ │ docker + noVNC       │  │ vortex-node-agent.ps1│  │ full VM clones       │
+ │ → provision_ubuntu   │  │ → provision_comfyui  │  │ → windows RDP        │
+ │ → destroy_ubuntu     │  │ → shell              │  │ → linux SSH          │
+ └──────────────────────┘  └──────────────────────┘  └──────────────────────┘
 ```
 
-## Isolation model (how the GPU stays hidden)
+## The three provisioning paths (they are NOT interchangeable)
 
-One shared ComfyUI codebase per host (`C:\vortex\comfyui-base`), **N isolated
-data dirs** (`C:\vortex\instances\<vm_id>\{user,output,input,models}`). Each
-instance launches with its own `--port` and its own `--user-directory`,
-`--output-directory`, `--input-directory`, so settings, checkpoints, and outputs
-never cross tenant boundaries. The tenant's ComfyUI URL is
-`http://<node-ip>:<port>` — they see a private, fresh machine. The physical RTX
-is shared underneath and the VRAM load is load-balanced across tenants.
+| Path | Endpoint | Target | What the tenant gets |
+|------|----------|--------|----------------------|
+| Ubuntu GPU session | `POST /api/session/spawn` | `nightmare` only (hardcoded) | Docker container + Xvfb/noVNC desktop, GPU attached, reached in-browser via `/session/<instanceId>/` |
+| Proxmox VM | `POST /api/vms/provision` | Proxmox `.85` | Full KVM clone — Windows RDP or Linux SSH on a dedicated port |
+| ComfyUI instance | `provision_comfyui` job | Windows nodes | Isolated ComfyUI port + data dirs (legacy path; not exposed in the current SPA) |
+
+**Node targeting is not load-balanced.** `/api/session/spawn` hardcodes
+`hostname = "nightmare"` because it is the only Linux node running the Docker /
+noVNC session agent. `light_reaper` is Windows and cannot host these sessions.
+Adding a second Linux node means replacing that constant with real selection.
+
+## GPU capacity (important)
+
+`nightmare`'s RTX 4080 SUPER is **shared with HyperSwap** (an ollama
+`llama-server` on the same box). With a model resident, ollama holds ~15.2 GB of
+the 16 GB card, leaving too little for a tenant to do GPU work.
+
+`POST /api/session/spawn` therefore preflights real `nvidia-smi` telemetry
+(`memTotalMb - memUsedMb`) and returns **503 with the actual free figure**
+rather than handing over — and billing for — a GPU machine that cannot compute.
+
+- `MIN_FREE_VRAM_MB` (default `2048`) — required free VRAM; set `0` to disable.
+- `GET /api/health` reports `gpuVramFreeMb` / `gpuVramTotalMb` / `minFreeVramMb`.
+
+To free VRAM when HyperSwap is idle, shorten ollama's keep-alive on `nightmare`
+(default there is 30m, so it pins VRAM long after the last request):
+
+```bash
+sudo mkdir -p /etc/systemd/system/ollama.service.d
+printf '[Service]\nEnvironment="OLLAMA_KEEP_ALIVE=5m"\n' \
+  | sudo tee /etc/systemd/system/ollama.service.d/vortex-vram.conf
+sudo systemctl daemon-reload && sudo systemctl restart ollama
+```
+
+Reverse it by deleting that file and restarting ollama.
+
+## Session isolation
+
+Each Ubuntu session gets its own container (`vortex-<instanceId>`), its own
+host port (6090–6190), and its own generated VNC password. The
+`/session/<instanceId>/` proxy is **unauthenticated by design** — noVNC loads it
+as a top-level navigation with no `Authorization` header, so the `instanceId`
+(16 random bytes) is itself the capability. It is also gated on session
+`state === 'running'`, enforced in the proxy router so WebSocket upgrades cannot
+bypass it. Capability URLs still leak via browser history and `Referer`;
+real per-session auth is the outstanding hardening item.
 
 ## BTCPay (real payments)
 
