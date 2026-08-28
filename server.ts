@@ -31,6 +31,22 @@ const exec = promisify(execFile);
 const PORT = Number(process.env.PORT) || 3000;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || crypto.randomBytes(24).toString("hex");
 const NODE_SECRET = process.env.NODE_SECRET || crypto.randomBytes(24).toString("hex");
+// Express `trust proxy` setting. Public traffic reaches this box through
+// Cloudflare and then the LAN, so X-Forwarded-For MUST still be honoured for
+// those requests — but only when the immediate peer is one of ours. The
+// 'loopback, linklocal, uniquelocal' shorthand trusts 127.0.0.1/::1, link-local
+// and private ranges (10/8 included) and nothing else, so a client connecting
+// straight from the internet can no longer forge its own rate-limit key.
+// Override with TRUST_PROXY (a hop count, `true`/`false`, or a CSV of
+// subnets/shorthands) if the deployment topology changes.
+function trustProxySetting(raw: string): string | number | boolean {
+  const v = raw.trim();
+  if (/^\d+$/.test(v)) return Number(v);
+  if (v.toLowerCase() === "true") return true;
+  if (v.toLowerCase() === "false") return false;
+  return v;
+}
+const TRUST_PROXY = trustProxySetting(str(process.env.TRUST_PROXY, "loopback, linklocal, uniquelocal"));
 
 // ---- Proxmox ----
 const PVE_HOST = process.env.PVE_HOST || "10.30.20.85";
@@ -395,18 +411,21 @@ function countActive(userId: string): number {
   return (v?.c || 0) + (s?.c || 0);
 }
 
+// Never parse X-Forwarded-For by hand: that header is attacker-controlled and
+// forging it rotated the caller around every IP-keyed rate limit below. `req.ip`
+// applies the `trust proxy` setting above, so XFF counts only when the request
+// actually arrived via loopback/the LAN (Cloudflare -> this box) and is ignored
+// for a direct connection from the internet.
 function clientIp(req: express.Request): string {
-  const fwd = req.headers["x-forwarded-for"];
-  const raw = (Array.isArray(fwd) ? fwd[0] : fwd)?.toString().split(",")[0].trim() || req.socket.remoteAddress || "";
-  return raw.replace(/^::ffff:/, "");
+  return String(req.ip || req.socket.remoteAddress || "").replace(/^::ffff:/, "");
 }
 
 // ---- Rate limiting (in-process fixed window; no new dependencies) ----
-// NOTE on keys: clientIp() trusts X-Forwarded-For, which any client can forge
-// unless a reverse proxy overwrites it. IP-keyed limits below are therefore
-// best-effort throttles for naive abuse. The limits that actually matter for
-// credential stuffing and invoice spam are keyed by username / user id, which
-// a caller cannot rotate.
+// NOTE on keys: clientIp() derives the key from req.ip under `trust proxy`, so
+// X-Forwarded-For counts only from a trusted peer and is no longer forgeable by
+// a direct caller. IP-keyed limits are still best-effort (a proxied client pool
+// can share an address). The limits that actually matter for credential stuffing
+// and invoice spam are keyed by username / user id, which a caller cannot rotate.
 type RateBucket = { count: number; resetAt: number };
 const RATE_BUCKETS = new Map<string, RateBucket>();
 setInterval(() => {
@@ -450,6 +469,7 @@ function btcpay(method: string, apiPath: string, body?: unknown): Promise<{ stat
 
 async function startServer() {
   const app = express();
+  app.set("trust proxy", TRUST_PROXY);
   app.use((req, res, next) => {
     if (req.method === "POST" && req.path === "/api/btcpay/webhook") return express.raw({ type: "application/json" })(req, res, next);
     express.json({ limit: "10mb" })(req, res, next);
