@@ -282,6 +282,20 @@ function issueToken(userId: string): string {
   AUTH_TOKENS.set(token, { userId, expiresAt: Date.now() + TOKEN_TTL_MS });
   return token;
 }
+// Revoke every live token for a user, optionally sparing one (the caller's, so a
+// password change does not log the tab out of the session that just did it).
+// Deleting from a Map while iterating it is well-defined; entries removed before
+// they are reached are simply not visited.
+function revokeUserTokens(userId: string, keepToken?: string): number {
+  let revoked = 0;
+  for (const [t, e] of AUTH_TOKENS) {
+    if (e.userId !== userId) continue;
+    if (keepToken && t === keepToken) continue;
+    AUTH_TOKENS.delete(t);
+    revoked++;
+  }
+  return revoked;
+}
 function resolveToken(token: string): string | null {
   const entry = token ? AUTH_TOKENS.get(token) : undefined;
   if (!entry) return null;
@@ -502,6 +516,44 @@ async function startServer() {
   app.post("/api/auth/logout", (req, res) => {
     const token = tokenFromReq(req);
     if (token) AUTH_TOKENS.delete(token);
+    res.json({ ok: true });
+  });
+
+  // Changing a password is a credential operation and runs scryptSync twice, which
+  // blocks the single-threaded event loop — rate-limit it like the other auth
+  // routes, keyed by the caller's user id (which a caller cannot rotate) and
+  // falling back to the source IP for unauthenticated noise.
+  app.post("/api/auth/change-password",
+    rateLimit("change-password", 10, 15 * 60_000, (req) => resolveToken(tokenFromReq(req)) || clientIp(req)),
+    (req, res) => {
+    const user = userFromReq(req);
+    if (!user) return res.status(401).json({ error: "not authenticated" });
+    const currentPassword = str(req.body?.currentPassword, "");
+    const newPassword = str(req.body?.newPassword, "");
+    // A NULL/blank password_hash is a legacy account with NO credential set. It is
+    // locked out of /api/auth/login for the same reason it must be locked out
+    // here: letting this route set the first password would hand the account to
+    // whoever reached it, reopening the takeover hole closed in d6dd5d4.
+    if (!user.password_hash) return res.status(403).json({ error: "account has no password set — contact support" });
+    // Bound scrypt work before doing any (see /api/auth/login).
+    if (currentPassword.length > MAX_PASSWORD_LEN) return res.status(401).json({ error: "wrong password" });
+    if (!verifyPassword(currentPassword, user.password_hash)) return res.status(401).json({ error: "wrong password" });
+    // Same rules as register.
+    if (newPassword.length < 6) return res.status(400).json({ error: "password must be at least 6 chars" });
+    if (newPassword.length > MAX_PASSWORD_LEN) return res.status(400).json({ error: `password must be at most ${MAX_PASSWORD_LEN} chars` });
+
+    q("UPDATE users SET password_hash=? WHERE id=?", hashPassword(newPassword), user.id);
+    // Every other bearer token for this account dies with the old password; the
+    // caller's own token survives so they are not logged out of the tab they
+    // just used.
+    revokeUserTokens(user.id, tokenFromReq(req));
+    res.json({ ok: true });
+  });
+
+  app.post("/api/auth/logout-all", (req, res) => {
+    const user = userFromReq(req);
+    if (!user) return res.status(401).json({ error: "not authenticated" });
+    revokeUserTokens(user.id); // includes the caller's own token
     res.json({ ok: true });
   });
 
