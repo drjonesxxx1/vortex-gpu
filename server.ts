@@ -247,11 +247,20 @@ async function vmStatus(vmid: number): Promise<string> {
 }
 
 // Allocate a unique public access port per VM (RDP 3389 / SSH 22 mapped to 30000+).
-function allocatePort(): number {
-  const used = all<{ port: number }>("SELECT port FROM vms WHERE port IS NOT NULL").map((r) => r.port);
-  let p = 30000 + (Math.floor(Math.random() * 20000));
-  while (used.includes(p)) p++;
-  return p;
+// Walk the range from a random start and wrap, so the search stays inside the
+// range instead of incrementing off the end of it. Returns null when every port
+// is taken — the caller must surface that, never hand out a duplicate.
+const VM_PORT_MIN = 30000;
+const VM_PORT_MAX = 49999;
+function allocatePort(): number | null {
+  const used = new Set(all<{ port: number }>("SELECT port FROM vms WHERE port IS NOT NULL").map((r) => r.port));
+  const span = VM_PORT_MAX - VM_PORT_MIN + 1;
+  const start = Math.floor(Math.random() * span);
+  for (let i = 0; i < span; i++) {
+    const p = VM_PORT_MIN + ((start + i) % span);
+    if (!used.has(p)) return p;
+  }
+  return null;
 }
 
 // One-click noVNC URL for a session. The container (novnc2 image) serves the
@@ -266,11 +275,15 @@ function desktopUrlFor(instanceId: string, password: string): string {
 }
 
 // Allocate a session (noVNC) port from a dedicated range, distinct from VM ports.
-function allocateSessionPort(): number {
-  const used = all<{ port: number }>("SELECT port FROM sessions WHERE port IS NOT NULL").map((r) => r.port);
-  let p = 6090;
-  while (used.includes(p) && p < 6190) p++;
-  return p;
+// The old loop stopped at 6190 and returned it even when it was already taken,
+// so an exhausted range silently handed two live sessions the same port. Return
+// null instead and let the caller refuse the spawn.
+const SESSION_PORT_MIN = 6090;
+const SESSION_PORT_MAX = 6190;
+function allocateSessionPort(): number | null {
+  const used = new Set(all<{ port: number }>("SELECT port FROM sessions WHERE port IS NOT NULL").map((r) => r.port));
+  for (let p = SESSION_PORT_MIN; p <= SESSION_PORT_MAX; p++) if (!used.has(p)) return p;
+  return null;
 }
 
 // Enqueue a GPU job for a node to pick up on its next poll.
@@ -643,6 +656,7 @@ async function startServer() {
     const vmid = nextVmid() + Math.floor(Math.random() * 1000);
     const vmUid = "vm_" + crypto.randomBytes(6).toString("hex");
     const port = allocatePort(); // dedicated access port
+    if (port === null) return res.status(503).json({ error: "no free ports — try again shortly" });
     const name = isWin ? `vortex-win-${vmid}` : `vortex-lin-${vmid}`;
     const username = isWin ? "administrator" : "rent";
     const password = "Vx" + crypto.randomBytes(6).toString("hex") + "!";
@@ -815,6 +829,7 @@ async function startServer() {
     // so the instance id IS the capability. 4 bytes was guessable; use 16.
     const instanceId = "sess_" + crypto.randomBytes(16).toString("hex");
     const port = allocateSessionPort();
+    if (port === null) return res.status(503).json({ error: "no free ports — try again shortly" });
     const password = "Ub" + crypto.randomBytes(6).toString("hex") + "!";
     const id = "ses_" + crypto.randomBytes(8).toString("hex");
     const proxy = assignProxy(); // clean ProxyFly proxy, auto-assigned in background
