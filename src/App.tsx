@@ -4,10 +4,10 @@ import {
   Activity, ArrowRight, Bitcoin, CheckCircle2, ChevronRight, Clock,
   Cpu, ExternalLink, Eye, EyeOff, Globe, KeyRound, Laptop, Lock,
   LogIn, LogOut, Menu, Monitor, Power, Rocket, Server, Shield, Terminal,
-  UserPlus, Wallet, X, Zap,
+  Trash2, UserPlus, Wallet, X, Zap,
 } from 'lucide-react';
 import {
-  Alert, BTN_AMBER, BTN_BASE, BTN_GHOST, BTN_PRIMARY, CopyField,
+  Alert, BTN_AMBER, BTN_BASE, BTN_GHOST, BTN_PRIMARY, ConfirmDialog, CopyField,
   INPUT_CLS, Spinner, StateBadge, cx, fmtBalance, readError, useDialogChrome,
 } from './components/ui';
 import './index.css';
@@ -192,6 +192,11 @@ function Dashboard({
   const [error, setError] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
   const [payOpen, setPayOpen] = useState(false);
+  /** Deletion is irreversible, so it goes through an explicit dialog. */
+  const [confirmDelete, setConfirmDelete] = useState<
+    { kind: 'vm' | 'session'; id: string; label: string } | null
+  >(null);
+  const [deleteError, setDeleteError] = useState('');
   const [nowTs, setNowTs] = useState(() => Date.now());
 
   const expired = useRef(false);
@@ -284,6 +289,31 @@ function Dashboard({
     run(os, '/api/vms/provision', { os }, `Could not deploy ${os === 'windows' ? 'Windows' : 'Linux'}`);
   const destroySession = (id: string) => run(`d:${id}`, '/api/session/destroy', { sessionId: id }, 'Could not stop session');
   const destroyVm = (id: string) => run(`d:${id}`, '/api/vms/destroy', { vmId: id }, 'Could not stop machine');
+
+  /** Removes the row for good. The server only allows it for stopped/failed
+   *  machines and answers 409 otherwise, which is shown inside the dialog. */
+  const runDelete = async () => {
+    if (!confirmDelete || busy) return;
+    const target = confirmDelete;
+    setBusy(`x:${target.id}`);
+    setDeleteError('');
+    try {
+      const r = target.kind === 'vm'
+        ? await post('/api/vms/delete', { vmId: target.id })
+        : await post('/api/session/delete', { sessionId: target.id });
+      if (!r.ok) { setDeleteError(await readError(r, 'Could not delete this machine')); return; }
+      setConfirmDelete(null);
+      await refresh();
+    } catch {
+      setDeleteError('Network error — check your connection and try again.');
+    } finally {
+      setBusy(null);
+    }
+  };
+  const askDelete = (kind: 'vm' | 'session', id: string, label: string) => {
+    setDeleteError('');
+    setConfirmDelete({ kind, id, label });
+  };
 
   const blocked = atCap
     ? `Machine limit reached (${meta.maxMachines} max). Stop one first.`
@@ -514,8 +544,10 @@ function Dashboard({
                     gpuSku={meta.gpuSku}
                     now={nowTs}
                     busy={busy === `d:${s.id}`}
+                    deleting={busy === `x:${s.id}`}
                     disabled={!!busy}
                     onStop={() => destroySession(s.id)}
+                    onDelete={() => askDelete('session', s.id, `Ubuntu GPU session ${s.instance_id}`)}
                   />
                 </li>
               ))}
@@ -525,8 +557,10 @@ function Dashboard({
                     vm={vm}
                     now={nowTs}
                     busy={busy === `d:${vm.id}`}
+                    deleting={busy === `x:${vm.id}`}
                     disabled={!!busy}
                     onStop={() => destroyVm(vm.id)}
+                    onDelete={() => askDelete('vm', vm.id, `${vm.os === 'windows' ? 'Windows 10' : 'Linux'} machine #${vm.vm_id}`)}
                   />
                 </li>
               ))}
@@ -539,6 +573,28 @@ function Dashboard({
           {unlimited ? 'unlimited' : meta.maxMachines} concurrent max · Bitcoin via BTCPay
         </p>
       </main>
+
+      {confirmDelete && (
+        <ConfirmDialog
+          title="Delete this machine?"
+          confirmLabel="Delete permanently"
+          busyLabel="Deleting…"
+          busy={busy === `x:${confirmDelete.id}`}
+          error={deleteError}
+          icon={<Trash2 className="w-5 h-5 text-red-400" aria-hidden="true" />}
+          onConfirm={runDelete}
+          onClose={() => { if (!busy) { setConfirmDelete(null); setDeleteError(''); } }}
+        >
+          <p>
+            <span className="font-semibold text-zinc-200">{confirmDelete.label}</span> will be removed from your
+            console for good.
+          </p>
+          <p>
+            This cannot be undone, and anything left on its disk goes with it. Deleting a stopped machine does not
+            cost or refund any balance.
+          </p>
+        </ConfirmDialog>
+      )}
 
       {payOpen && <PayModal token={token} pricePerHour={meta.price} currentMinutes={user.balance_minutes} onClose={() => setPayOpen(false)} onCredited={refresh} />}
     </div>
@@ -597,13 +653,16 @@ function ProductCard({
 }
 
 function SessionCard({
-  s, gpuSku, now, busy, disabled, onStop,
+  s, gpuSku, now, busy, deleting, disabled, onStop, onDelete,
 }: {
-  s: ApiSession; gpuSku: string; now: number; busy: boolean; disabled: boolean; onStop: () => void;
+  s: ApiSession; gpuSku: string; now: number; busy: boolean; deleting: boolean;
+  disabled: boolean; onStop: () => void; onDelete: () => void;
 }) {
   const isRunning = s.state === 'running';
   const isProvisioning = s.state === 'provisioning';
   const isActive = isRunning || isProvisioning;
+  /** The server refuses to delete anything still running. */
+  const removable = s.state === 'stopped' || s.state === 'failed';
 
   return (
     <article
@@ -674,6 +733,19 @@ function SessionCard({
               {busy ? <Spinner className="w-3.5 h-3.5" /> : <Power className="w-3.5 h-3.5" aria-hidden="true" />} Stop
             </button>
           )}
+          {removable && (
+            <button
+              type="button"
+              onClick={onDelete}
+              disabled={disabled}
+              aria-busy={deleting}
+              aria-label={`Delete session ${s.instance_id}`}
+              className={cx(BTN_BASE, 'border border-red-500/40 px-4 py-2.5 text-xs text-red-300 hover:bg-red-500/10')}
+            >
+              {deleting ? <Spinner className="w-3.5 h-3.5" /> : <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />}
+              {deleting ? 'Deleting…' : 'Delete'}
+            </button>
+          )}
         </div>
         <div className="mt-3">
           <CopyField label="VNC password" value={s.password} secret />
@@ -684,12 +756,15 @@ function SessionCard({
 }
 
 function VmCard({
-  vm, now, busy, disabled, onStop,
+  vm, now, busy, deleting, disabled, onStop, onDelete,
 }: {
-  vm: ApiVm; now: number; busy: boolean; disabled: boolean; onStop: () => void;
+  vm: ApiVm; now: number; busy: boolean; deleting: boolean;
+  disabled: boolean; onStop: () => void; onDelete: () => void;
 }) {
   const isWin = vm.os === 'windows';
   const isActive = vm.state === 'running' || vm.state === 'provisioning';
+  /** The server refuses to delete anything still running. */
+  const removable = vm.state === 'stopped' || vm.state === 'failed';
   return (
     <article
       className={cx(
@@ -719,7 +794,7 @@ function VmCard({
         <p className="mt-4 flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-zinc-400">
           {vm.state === 'stopping'
             ? <><Spinner className="w-3.5 h-3.5" /> Shutting down — this machine has stopped billing.</>
-            : <><Power className="w-3.5 h-3.5" aria-hidden="true" /> Stopped. Deploy a new machine above when you need one.</>}
+            : <><Power className="w-3.5 h-3.5" aria-hidden="true" /> Stopped and no longer billing. Delete it to clear it from the console.</>}
         </p>
       )}
       {vm.state === 'failed' && (
@@ -756,6 +831,22 @@ function VmCard({
           >
             {busy ? <Spinner className="w-3.5 h-3.5" /> : <Power className="w-3.5 h-3.5" aria-hidden="true" />}
             {busy ? 'Stopping…' : 'Stop machine'}
+          </button>
+        </div>
+      )}
+
+      {removable && (
+        <div className="mt-auto pt-4">
+          <button
+            type="button"
+            onClick={onDelete}
+            disabled={disabled}
+            aria-busy={deleting}
+            aria-label={`Delete ${isWin ? 'Windows' : 'Linux'} machine ${vm.vm_id}`}
+            className={cx(BTN_BASE, 'w-full border border-red-500/40 py-2.5 text-xs text-red-300 hover:bg-red-500/10')}
+          >
+            {deleting ? <Spinner className="w-3.5 h-3.5" /> : <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />}
+            {deleting ? 'Deleting…' : 'Delete machine'}
           </button>
         </div>
       )}
