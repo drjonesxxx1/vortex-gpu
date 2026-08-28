@@ -943,6 +943,32 @@ async function startServer() {
     res.json({ ok: true, jobId: job.id });
   });
 
+  // Operator password reset. d6dd5d4 correctly made a NULL/blank password_hash a
+  // hard 403 on login and change-password, but left the affected legacy accounts
+  // with no recovery path at all. This is that path — and it MUST work when
+  // password_hash is NULL, which is its entire purpose. It is safe here precisely
+  // because it is gated on ADMIN_TOKEN rather than on possession of the account.
+  app.post("/api/admin/set-password", (req, res) => {
+    if (!adminAuthorized(req)) return res.status(404).json({ error: "not found" });
+    const userId = str(req.body?.userId, "");
+    const username = str(req.body?.username, "").slice(0, 64).trim();
+    const newPassword = str(req.body?.newPassword, "");
+    if (!userId && !username) return res.status(400).json({ error: "username or userId required" });
+    // Same rules as register.
+    if (newPassword.length < 6) return res.status(400).json({ error: "password must be at least 6 chars" });
+    if (newPassword.length > MAX_PASSWORD_LEN) return res.status(400).json({ error: `password must be at most ${MAX_PASSWORD_LEN} chars` });
+    const user = userId
+      ? one<any>("SELECT * FROM users WHERE id=?", userId)
+      : one<any>("SELECT * FROM users WHERE username=?", username);
+    if (!user) return res.status(404).json({ error: "user not found" });
+
+    q("UPDATE users SET password_hash=? WHERE id=?", hashPassword(newPassword), user.id);
+    // Whoever held a token for this account before the reset should not keep it.
+    const revoked = revokeUserTokens(user.id);
+    console.warn(`[admin] password set for ${user.username} (${user.id}) from ${clientIp(req)}; ${revoked} token(s) revoked`);
+    res.json({ ok: true });
+  });
+
   app.post("/api/admin/credit", (req, res) => {
     if (!adminAuthorized(req)) return res.status(404).json({ error: "not found" });
     const userId = str(req.body?.userId, "");
