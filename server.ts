@@ -571,6 +571,16 @@ async function startServer() {
     });
   });
 
+  // Account detail for the settings screen. Explicit column list — `users` also
+  // holds password_hash, which must never leave the process.
+  app.get("/api/account", (req, res) => {
+    const user = userFromReq(req);
+    if (!user) return res.status(401).json({ error: "not authenticated" });
+    const row = one<any>("SELECT id,username,balance_minutes,unlimited,btc_address,created_at FROM users WHERE id=?", user.id);
+    if (!row) return res.status(404).json({ error: "not found" });
+    res.json({ user: { id: row.id, username: row.username, balance_minutes: row.balance_minutes, unlimited: !!row.unlimited, btc_address: row.btc_address, created_at: row.created_at } });
+  });
+
   // ===== VM PROVISIONING (real KVM clone) =====
   app.post("/api/vms/provision", async (req, res) => {
     const user = userFromReq(req);
@@ -712,6 +722,18 @@ async function startServer() {
       }
     }
     res.json({ received: true });
+  });
+
+  // The caller's own invoices, newest first. Scoped by user_id, and the column
+  // list deliberately omits btcpay_invoice_id — that id addresses the invoice on
+  // the BTCPay side and has no business in a browser.
+  app.get("/api/invoices", (req, res) => {
+    const user = userFromReq(req);
+    if (!user) return res.status(401).json({ error: "not authenticated" });
+    const invoices = all<any>(
+      "SELECT id,amount_usd,minutes,status,checkout_link,created_at,settled_at FROM invoices WHERE user_id=? ORDER BY created_at DESC LIMIT 100",
+      user.id);
+    res.json({ invoices });
   });
 
   // ===== UBUNTU GPU SESSIONS (spawn in-browser desktop with the 4080 attached) =====
