@@ -63,6 +63,11 @@ const BTCPAY_PUBLIC = process.env.BTCPAY_PUBLIC || "https://btcpay.thetempleofdo
 const WEBHOOK_SECRET = process.env.BTCPAY_WEBHOOK_SECRET || "";
 if (!WEBHOOK_SECRET) throw new Error("BTCPAY_WEBHOOK_SECRET is required; refusing to start with an unsigned-webhook fallback");
 const OWNER_SEED_PASSWORD = process.env.OWNER_SEED_PASSWORD || "";
+// InvoiceProcessing means BTCPay has SEEN a payment, not that it is confirmed —
+// a replaced/double-spent transaction still fires it. Crediting on it hands out
+// GPU time for money that may never arrive, so settlement is the default and the
+// faster, riskier behaviour is opt-in via CREDIT_ON_PROCESSING=1.
+const CREDIT_ON_PROCESSING = process.env.CREDIT_ON_PROCESSING === "1";
 const PRICE_USD_PER_HOUR = 1.0;
 const MAX_INVOICE_CENTS = 1_000_000; // $10,000 ceiling on a single top-up
 // A tenant session is advertised as a GPU machine. Handing one out on a node
@@ -742,7 +747,12 @@ async function startServer() {
     try { payload = JSON.parse(req.body.toString("utf8")); } catch { return res.status(400).json({ error: "invalid json" }); }
 
     const invoiceId = str(payload?.invoiceId, "");
-    if ((payload?.type === "InvoiceSettled" || payload?.type === "InvoiceProcessing") && invoiceId) {
+    // Anything else (InvoiceCreated, InvoiceExpired, InvoiceProcessing when the
+    // opt-in is off, ...) is acknowledged with 200 and ignored — BTCPay retries
+    // on any non-2xx.
+    const eventType = str(payload?.type, "");
+    const creditable = eventType === "InvoiceSettled" || (CREDIT_ON_PROCESSING && eventType === "InvoiceProcessing");
+    if (creditable && invoiceId) {
       const inv = one<any>("SELECT * FROM invoices WHERE btcpay_invoice_id=?", invoiceId);
       // Replay guard: the status flip and the credit happen in one synchronous
       // block (node:sqlite is sync, the loop is single-threaded), so a replayed
