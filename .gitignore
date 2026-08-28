@@ -11,3 +11,4 @@ data/*.db-wal
 src.bak.*
 data/*.json
 !data/.gitkeep
+dist.rollback-*/
