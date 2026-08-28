@@ -3,13 +3,14 @@ import { createPortal } from 'react-dom';
 import {
   Activity, ArrowRight, Bitcoin, CheckCircle2, ChevronRight, Clock,
   Cpu, ExternalLink, Eye, EyeOff, Globe, KeyRound, Laptop, Lock,
-  LogIn, LogOut, Menu, Monitor, Power, Rocket, Server, Shield, Terminal,
-  Trash2, UserPlus, Wallet, X, Zap,
+  LogIn, LogOut, Menu, Monitor, Power, Rocket, Server, Settings as SettingsIcon,
+  Shield, Terminal, Trash2, UserPlus, Wallet, X, Zap,
 } from 'lucide-react';
 import {
   Alert, BTN_AMBER, BTN_BASE, BTN_GHOST, BTN_PRIMARY, ConfirmDialog, CopyField,
   INPUT_CLS, Spinner, StateBadge, cx, fmtBalance, readError, useDialogChrome,
 } from './components/ui';
+import { SettingsView } from './components/SettingsView';
 import './index.css';
 
 /** three.js is ~460 kB of the bundle and the hero renders fine without it for a
@@ -140,14 +141,14 @@ export default function App() {
     setAuth(a);
   }, []);
 
-  const signOut = useCallback((token?: string) => {
+  const signOut = useCallback((token?: string, landOn: 'landing' | 'auth' = 'landing') => {
     if (token) {
       // Best-effort server-side token revocation; never blocks the UI.
       fetch('/api/auth/logout', { method: 'POST', headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
     }
     try { localStorage.removeItem(AUTH_KEY); } catch { /* ignore */ }
     setAuth(null);
-    setView('landing');
+    setView(landOn);
   }, []);
 
   // Avoid a landing-page flash for returning users while localStorage is read.
@@ -166,17 +167,27 @@ export default function App() {
       : <AuthGate onAuthed={signIn} onBack={() => setView('landing')} />;
   }
 
-  return <Dashboard auth={auth} setAuth={setAuth} onSignOut={() => signOut(auth.token)} />;
+  return (
+    <Dashboard
+      auth={auth}
+      setAuth={setAuth}
+      onSignOut={() => signOut(auth.token)}
+      /* "Log out everywhere" already revoked this token server-side, so skip
+       * the extra logout call and drop straight onto the sign-in form. */
+      onSessionsRevoked={() => signOut(undefined, 'auth')}
+    />
+  );
 }
 
 /* ------------------------------------------------------------- dashboard */
 
 function Dashboard({
-  auth, setAuth, onSignOut,
+  auth, setAuth, onSignOut, onSessionsRevoked,
 }: {
   auth: Auth;
   setAuth: React.Dispatch<React.SetStateAction<Auth | null>>;
   onSignOut: () => void;
+  onSessionsRevoked: () => void;
 }) {
   const { token } = auth;
   const [vms, setVms] = useState<ApiVm[]>([]);
@@ -192,6 +203,7 @@ function Dashboard({
   const [error, setError] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
   const [payOpen, setPayOpen] = useState(false);
+  const [tab, setTab] = useState<'console' | 'settings'>('console');
   /** Deletion is irreversible, so it goes through an explicit dialog. */
   const [confirmDelete, setConfirmDelete] = useState<
     { kind: 'vm' | 'session'; id: string; label: string } | null
@@ -351,6 +363,21 @@ function Dashboard({
             </div>
             <button
               type="button"
+              onClick={() => setTab((t) => (t === 'settings' ? 'console' : 'settings'))}
+              aria-label={tab === 'settings' ? 'Back to console' : 'Settings'}
+              title={tab === 'settings' ? 'Back to console' : 'Settings'}
+              aria-pressed={tab === 'settings'}
+              className={cx(
+                'rounded-lg border p-2 transition-colors',
+                tab === 'settings'
+                  ? 'border-cyan-400/60 bg-cyan-400/10 text-cyan-300'
+                  : 'border-white/10 text-zinc-400 hover:border-white/25 hover:text-white',
+              )}
+            >
+              <SettingsIcon className="w-4 h-4" aria-hidden="true" />
+            </button>
+            <button
+              type="button"
               onClick={onSignOut}
               aria-label="Sign out"
               title="Sign out"
@@ -393,6 +420,15 @@ function Dashboard({
           )}
         </div>
 
+        {tab === 'settings' ? (
+          <SettingsView
+            token={token}
+            fallbackUser={user}
+            onBack={() => setTab('console')}
+            onLoggedOutEverywhere={onSessionsRevoked}
+          />
+        ) : (
+        <>
         {/* ---- Account summary ---- */}
         <section aria-label="Account summary" className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <div className="surface rounded-2xl p-5">
@@ -572,6 +608,8 @@ function Dashboard({
           ${meta.price}/hr per billed machine · first {meta.freeMachines} free ·{' '}
           {unlimited ? 'unlimited' : meta.maxMachines} concurrent max · Bitcoin via BTCPay
         </p>
+        </>
+        )}
       </main>
 
       {confirmDelete && (
