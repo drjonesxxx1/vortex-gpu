@@ -126,6 +126,27 @@ const jobs: GpuJob[] = loadJson(JOBS_FILE, []);
 function persistNodes() { saveJson(NODES_FILE, nodes); }
 function persistJobs() { saveJson(JOBS_FILE, jobs); }
 
+// A node is "online" if it phoned home in the last 30s — that short window drives
+// spawn eligibility and the admin online/offline badge and is deliberately left
+// alone. Separately, a node that has not reported in a WEEK is gone for good
+// (renamed host, decommissioned box, a one-off registration that never came
+// back) and must stop inflating the advertised fleet size. Prune it.
+const NODE_ONLINE_MS = 30_000;
+const NODE_STALE_MS = Math.max(60_000, num(process.env.NODE_STALE_MS, 7 * 24 * 60 * 60 * 1000));
+function isStaleNode(n: GpuNode, now = Date.now()): boolean { return now - n.lastSeen > NODE_STALE_MS; }
+function pruneStaleNodes(): number {
+  const now = Date.now();
+  let pruned = 0;
+  for (const [hostname, n] of Object.entries(nodes)) {
+    if (!isStaleNode(n, now)) continue;
+    delete nodes[hostname];
+    pruned++;
+    console.warn(`[nodes] pruned stale node ${hostname} (last seen ${new Date(n.lastSeen).toISOString()})`);
+  }
+  if (pruned) persistNodes();
+  return pruned;
+}
+
 function num(v: unknown, fb: number): number { const n = Number(v); return Number.isFinite(n) ? n : fb; }
 function str(v: unknown, fb: string): string { return typeof v === "string" && v.length ? v : fb; }
 function normHost(v: unknown): string { return str(v, "").toLowerCase().trim(); }
@@ -350,6 +371,10 @@ setInterval(() => {
   for (const [t, e] of AUTH_TOKENS) if (now >= e.expiresAt) AUTH_TOKENS.delete(t);
 }, 10 * 60_000);
 
+// Sweep the node registry on boot and hourly thereafter.
+pruneStaleNodes();
+setInterval(pruneStaleNodes, 60 * 60_000);
+
 function tokenFromReq(req: express.Request): string {
   const auth = String(req.headers["authorization"] || "");
   return auth.startsWith("Bearer ") ? auth.slice(7) : String(req.headers["x-auth-token"] || "");
@@ -498,17 +523,21 @@ async function startServer() {
 
   // ===== PUBLIC =====
   app.get("/api/health", (_req, res) => {
-    const online = Object.values(nodes).filter((n) => Date.now() - n.lastSeen < 30_000);
+    const now = Date.now();
+    // Long-dead nodes are excluded from the advertised fleet size (and pruned by
+    // the sweep above); the 30s online window is unchanged.
+    const known = Object.values(nodes).filter((n) => !isStaleNode(n, now));
+    const online = known.filter((n) => now - n.lastSeen < NODE_ONLINE_MS);
     const sessionNode = nodes[SESSION_NODE];
     res.json({
       status: "ok", node: "VortexGPU",
-      gpuNodesOnline: online.length, gpuNodesTotal: Object.keys(nodes).length,
+      gpuNodesOnline: online.length, gpuNodesTotal: known.length,
       // Real capacity, so the UI can show what is actually available rather than
       // implying the full card is free.
       // Report the SESSION node specifically. Aggregating across the fleet
       // advertised a Windows node's headroom for a Linux-only capability.
       sessionNode: SESSION_NODE,
-      sessionNodeOnline: !!sessionNode && Date.now() - sessionNode.lastSeen < 30_000,
+      sessionNodeOnline: !!sessionNode && now - sessionNode.lastSeen < NODE_ONLINE_MS,
       gpuVramFreeMb: sessionNode ? Math.max(0, (sessionNode.memTotalMb || 0) - (sessionNode.memUsedMb || 0)) : 0,
       gpuVramTotalMb: sessionNode ? (sessionNode.memTotalMb || 0) : 0,
       minFreeVramMb: MIN_FREE_VRAM_MB,
