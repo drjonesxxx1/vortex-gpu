@@ -531,6 +531,49 @@ function rateLimit(name: string, limit: number, windowMs: number, keyFn?: (req: 
   };
 }
 
+// ---- Free-tier abuse limit ----
+// Every new account gets FREE_MACHINES worth of unbilled capacity, so account
+// creation is free GPU time and registration rate limits only slow the farming
+// down. This caps how many *free* machines one source IP can take in a window.
+//
+// OFF BY DEFAULT (0). Enabling it can affect legitimate users who share an
+// egress IP (CGNAT, an office, a VPN), so the number is yours to choose --
+// nothing changes until FREE_MACHINE_IP_LIMIT is set.
+const FREE_MACHINE_IP_LIMIT = Math.max(0, num(process.env.FREE_MACHINE_IP_LIMIT, 0));
+const FREE_MACHINE_IP_WINDOW_MS = Math.max(60_000, num(process.env.FREE_MACHINE_IP_WINDOW_MS, 24 * 60 * 60_000));
+const FREE_MACHINE_IP_BUCKETS = new Map<string, { count: number; resetAt: number }>();
+
+// Check and record are deliberately separate: a provision that fails (node
+// offline, no free ports, clone error) must not burn the caller's free-tier
+// quota for the rest of the window. Only a machine that was actually handed
+// out counts. Paying and unlimited accounts are never counted at all, so a
+// customer with balance is unaffected.
+function freeMachineDenial(req: express.Request, user: any): string | null {
+  if (FREE_MACHINE_IP_LIMIT <= 0) return null;
+  if (user.unlimited || Number(user.balance_minutes) > 0) return null;
+  const b = FREE_MACHINE_IP_BUCKETS.get(clientIp(req));
+  if (!b || Date.now() >= b.resetAt) return null;
+  if (b.count >= FREE_MACHINE_IP_LIMIT) {
+    console.warn(`[freetier] refused free machine for ${user.username} from ${clientIp(req)} (${b.count}/${FREE_MACHINE_IP_LIMIT} in window)`);
+    return "free-tier limit reached for this network — add Bitcoin balance to deploy";
+  }
+  return null;
+}
+
+function recordFreeMachine(req: express.Request, user: any): void {
+  if (FREE_MACHINE_IP_LIMIT <= 0) return;
+  if (user.unlimited || Number(user.balance_minutes) > 0) return;
+  const key = clientIp(req);
+  const now = Date.now();
+  let b = FREE_MACHINE_IP_BUCKETS.get(key);
+  if (!b || now >= b.resetAt) { b = { count: 0, resetAt: now + FREE_MACHINE_IP_WINDOW_MS }; FREE_MACHINE_IP_BUCKETS.set(key, b); }
+  b.count++;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of FREE_MACHINE_IP_BUCKETS) if (now >= b.resetAt) FREE_MACHINE_IP_BUCKETS.delete(k);
+}, 60 * 60_000);
+
 // ---- BTCPay client (self-signed LAN) ----
 function btcpay(method: string, apiPath: string, body?: unknown): Promise<{ status: number; data: any }> {
   return new Promise((resolve) => {
@@ -718,6 +761,8 @@ async function startServer() {
     const active = countActive(user.id);
     if (!unlimited && active >= FREE_MACHINES && user.balance_minutes <= 0) return res.status(402).json({ error: "insufficient balance — your first machine is free; top up with Bitcoin for more" });
     if (!unlimited && active >= MAX_VMS_PER_USER) return res.status(429).json({ error: `limit reached — max ${MAX_VMS_PER_USER} machines per account` });
+    const freeDenied = freeMachineDenial(req, user);
+    if (freeDenied) return res.status(402).json({ error: freeDenied });
 
     const isWin = osName === "windows";
     const template = isWin ? PVE_TEMPLATE_WIN : PVE_TEMPLATE_LINUX;
@@ -740,6 +785,7 @@ async function startServer() {
       q("UPDATE vms SET state=?, ip=? WHERE id=?", s.ok ? "running" : st, PVE_HOST, vmUid);
     });
 
+    recordFreeMachine(req, user);
     res.json({
       vmId: vmUid, os: isWin ? "windows" : "linux", sku: GPU_SKU, state: "provisioning",
       access: isWin ? { protocol: "rdp", host: PVE_HOST, port, username, password } : { protocol: "ssh", host: PVE_HOST, port, username, password },
@@ -889,6 +935,8 @@ async function startServer() {
     const active = countActive(user.id);
     if (!unlimited && active >= FREE_MACHINES && user.balance_minutes <= 0) return res.status(402).json({ error: "insufficient balance — your first machine is free; top up with Bitcoin for more" });
     if (!unlimited && active >= MAX_VMS_PER_USER) return res.status(429).json({ error: `limit reached — max ${MAX_VMS_PER_USER} machines per account` });
+    const freeDeniedSess = freeMachineDenial(req, user);
+    if (freeDeniedSess) return res.status(402).json({ error: freeDeniedSess });
 
     // Target the Linux GPU node (nightmare) that runs the Ubuntu-session agent.
     const hostname = SESSION_NODE;
@@ -916,6 +964,7 @@ async function startServer() {
       id, user.id, instanceId, hostname, node.ip, port, password, reso, proxy?.proxy ?? null, "provisioning", Date.now());
     dispatchJob(hostname, "provision_ubuntu", "", { instanceId, port, password, resolution: reso, proxy: proxy?.proxy ?? null });
 
+    recordFreeMachine(req, user);
     res.json({ id, instanceId, port, password, resolution: reso, proxy: proxy?.proxy ?? null, state: "provisioning", url: `/session/${instanceId}/`, desktopUrl: desktopUrlFor(instanceId, password) });
   });
 
