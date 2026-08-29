@@ -89,18 +89,84 @@ real per-session auth is the outstanding hardening item.
 
 ## Endpoints
 
+Auth column: **none** = public; **bearer** = user token from login/register
+(`Authorization: Bearer <token>`, or `X-Auth-Token`); **admin** = `ADMIN_TOKEN`
+as a bearer token, 404 when absent so the surface is not discoverable;
+**node** = `X-NODE-SECRET`; **HMAC** = BTCPay signature over the raw body.
+
 | Path | Auth | Purpose |
 |------|------|---------|
-| `POST /api/session` | none | No-KYC login → user row (120 min welcome bonus) |
-| `GET /api/me?userId=` | none | balance + instances |
-| `POST /api/btcpay/create-invoice` | none | real BTCPay invoice |
-| `POST /api/btcpay/webhook` | BTCPay | settle invoice → credit balance |
-| `POST /api/vms/provision` | none | allocate isolated ComfyUI on a GPU node |
-| `POST /api/node/register` | X-NODE-SECRET | GPU box registers |
-| `POST /api/node/report` | X-NODE-SECRET | nvidia-smi telemetry |
-| `GET /api/node/jobs` | X-NODE-SECRET | poll for shell/provision/destroy jobs |
-| `GET /admin?token=` | token | hidden admin SPA (404 without token) |
-| `GET /api/admin/*` | Bearer | admin state, GPU jobs, credit, users |
+| `GET /api/health` | none | status, price, limits, live GPU VRAM headroom |
+| `POST /api/auth/register` | none | create account (username + password only) |
+| `POST /api/auth/login` | none | issue bearer token |
+| `POST /api/auth/logout` | bearer | revoke the calling token |
+| `POST /api/auth/logout-all` | bearer | revoke every token for this user |
+| `POST /api/auth/change-password` | bearer | rotate password, revoke other tokens |
+| `GET /api/me` | bearer | balance, machines, sessions, limits |
+| `GET /api/account` | bearer | account detail (never returns password_hash) |
+| `GET /api/invoices` | bearer | this user's invoices only |
+| `POST /api/btcpay/create-invoice` | bearer | real BTCPay invoice |
+| `POST /api/btcpay/webhook` | HMAC | credit balance on InvoiceSettled |
+| `POST /api/session/spawn` | bearer | Ubuntu GPU session (VRAM preflight) |
+| `GET /api/sessions` | bearer | this user's sessions (bare array) |
+| `POST /api/session/destroy` | bearer | stop a session |
+| `POST /api/session/delete` | bearer | remove a stopped session (409 if running) |
+| `POST /api/vms/provision` | bearer | clone a Proxmox VM (Windows RDP / Linux SSH) |
+| `POST /api/vms/destroy` | bearer | shut a VM down |
+| `POST /api/vms/delete` | bearer | reclaim the guest + row (409 if running) |
+| `GET /session/:instanceId/` | capability | noVNC desktop proxy; gated on state=running |
+| `GET /api/proxy/pool` | none | public proxy pool sample |
+| `POST /api/node/register` | node | GPU box registers |
+| `POST /api/node/report` | node | nvidia-smi telemetry |
+| `GET /api/node/jobs` | node | poll for pending jobs |
+| `POST /api/node/jobs/:id/result` | node | report job result |
+| `GET /admin?token=` | admin | hidden admin SPA (404 without token) |
+| `GET /api/admin/state` | admin | nodes, jobs, vms, users, invoices |
+| `POST /api/admin/gpu/run` | admin | run a shell job on a node (RCE by design) |
+| `POST /api/admin/credit` | admin | adjust a user's balance |
+| `POST /api/admin/set-password` | admin | recover an account with no password set |
+
+Rate limited: login (per IP **and** per targeted username), register, invoice
+creation, change-password. The IP-keyed limits are only as trustworthy as
+`TRUST_PROXY` — see `.env.example`.
+
+## Operations
+
+**Deploying.** `bash deploy.sh [commit]` builds from a clean git checkout (so
+uncommitted working-tree changes never ship), backs up `dist/`, restarts,
+health-checks, and **rolls back automatically** if `/api/health` does not come
+back 200. It keeps the last 3 rollback snapshots. A restart logs everyone out —
+bearer tokens are in-memory by design.
+
+**VM lifecycle.** `destroy` shuts a guest down; `delete` reclaims it. Delete
+runs `qm destroy --purge` **before** dropping the DB row, so a failed reclaim
+keeps the row for retry instead of stranding a guest. A guest that is already
+gone counts as success, which also heals rows whose guest was removed by hand.
+Running machines cannot be deleted (409) — stop them first.
+
+**Drift reconciliation.** The `vms` table is only written when a request
+happens, so it drifts from the hypervisor: a guest started or stopped outside
+the gateway keeps a stale state, and a guest deleted by hand leaves a phantom
+row. Every `VM_RECONCILE_MS` the gateway re-reads `qm list` and corrects state.
+It only ever UPDATEs `state` — never deletes a row, never changes anything on
+the host — and skips rows younger than 15 minutes so a clone in flight is never
+marked failed.
+
+**Recovering a locked-out account.** A NULL/blank `password_hash` is a hard 403
+on login (it must never be claimable — that was an account-takeover hole). Set
+one out-of-band:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/admin/set-password \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"username":"someuser","newPassword":"..."}'
+```
+
+**Testing.** The API suites live outside the repo; `MANUAL-QA.md` covers what
+automation cannot reach (the rendered UI). Never point a mutating test at
+port 3000 — run against a scratch cwd with its own SQLite file on another port,
+and never exercise `/api/vms/provision` casually: it clones a real KVM guest.
 
 ## Windows GPU agent
 
