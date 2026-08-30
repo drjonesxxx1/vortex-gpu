@@ -24,6 +24,17 @@ export const BTN_AMBER = `${BTN_BASE} bg-amber-400 text-ink-950 hover:bg-amber-3
 export const BTN_GHOST = `${BTN_BASE} border border-white/15 text-zinc-200 hover:border-cyan-400/50 hover:text-white`;
 export const BTN_DANGER = `${BTN_BASE} border border-red-500/40 text-red-300 hover:bg-red-500/10`;
 
+/**
+ * The three product accents. Emerald is the Ubuntu GPU session, cyan is
+ * Windows, violet is Linux — the same mapping everywhere a machine type is
+ * drawn, so a colour always means the same product.
+ */
+export const ACCENTS = {
+  emerald: { text: 'text-emerald-400', ring: 'hover:border-emerald-400/40', btn: 'bg-emerald-400 text-ink-950 hover:bg-emerald-300' },
+  cyan: { text: 'text-cyan-400', ring: 'hover:border-cyan-400/40', btn: 'bg-cyan-400 text-ink-950 hover:bg-cyan-300' },
+  violet: { text: 'text-violet-400', ring: 'hover:border-violet-400/40', btn: 'bg-violet-400 text-ink-950 hover:bg-violet-300' },
+} as const;
+
 /* Text inputs — same recipe the auth form uses. */
 export const INPUT_CLS =
   'w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-sm text-zinc-100 ' +

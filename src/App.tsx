@@ -1,16 +1,17 @@
 import React, { Suspense, lazy, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  Activity, ArrowRight, Bitcoin, CheckCircle2, ChevronRight, Clock,
+  Activity, ArrowRight, Bitcoin, BookOpen, CheckCircle2, ChevronRight, Clock,
   Cpu, ExternalLink, Eye, EyeOff, Globe, Laptop, Lock,
   LogIn, LogOut, Menu, Monitor, Plug, Power, Rocket, Server, Settings as SettingsIcon,
   Shield, Terminal, Trash2, UserPlus, Wallet, X, Zap,
 } from 'lucide-react';
 import {
-  Alert, BTN_AMBER, BTN_BASE, BTN_GHOST, BTN_PRIMARY, ConfirmDialog, CopyField,
+  ACCENTS, Alert, BTN_AMBER, BTN_BASE, BTN_GHOST, BTN_PRIMARY, ConfirmDialog, CopyField,
   INPUT_CLS, Spinner, StateBadge, cx, fmtBalance, readError, useDialogChrome,
 } from './components/ui';
 import { SettingsView } from './components/SettingsView';
+import { GuideView } from './components/GuideView';
 import { vmEndpoint } from './connect';
 import {
   type Capacity, type Health, fmtVram, readCapacity, useHealth,
@@ -103,7 +104,9 @@ function Logo({ className = 'text-lg' }: { className?: string }) {
 export default function App() {
   const [auth, setAuth] = useState<Auth | null>(null);
   const [restored, setRestored] = useState(false);
-  const [view, setView] = useState<'landing' | 'auth'>('landing');
+  /** Signed-out surfaces. The guide is reachable without an account, so it is a
+   *  peer of the landing page rather than something behind the auth gate. */
+  const [view, setView] = useState<'landing' | 'auth' | 'guide'>('landing');
 
   useEffect(() => {
     try {
@@ -142,8 +145,11 @@ export default function App() {
   }
 
   if (!auth) {
+    if (view === 'guide') {
+      return <GuidePage onBack={() => setView('landing')} onLaunch={() => setView('auth')} />;
+    }
     return view === 'landing'
-      ? <LandingPage onLaunch={() => setView('auth')} />
+      ? <LandingPage onLaunch={() => setView('auth')} onGuide={() => setView('guide')} />
       : <AuthGate onAuthed={signIn} onBack={() => setView('landing')} />;
   }
 
@@ -184,7 +190,8 @@ function Dashboard({
   const [error, setError] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
   const [payOpen, setPayOpen] = useState(false);
-  const [tab, setTab] = useState<'console' | 'settings'>('console');
+  /** Same toggle pattern as settings: one piece of state, no router. */
+  const [tab, setTab] = useState<'console' | 'settings' | 'guide'>('console');
   /** Deletion is irreversible, so it goes through an explicit dialog. */
   const [confirmDelete, setConfirmDelete] = useState<
     { kind: 'vm' | 'session'; id: string; label: string } | null
@@ -366,6 +373,21 @@ function Dashboard({
             </div>
             <button
               type="button"
+              onClick={() => setTab((t) => (t === 'guide' ? 'console' : 'guide'))}
+              aria-label={tab === 'guide' ? 'Back to console' : 'How it works'}
+              title={tab === 'guide' ? 'Back to console' : 'How it works'}
+              aria-pressed={tab === 'guide'}
+              className={cx(
+                'rounded-lg border p-2 transition-colors',
+                tab === 'guide'
+                  ? 'border-cyan-400/60 bg-cyan-400/10 text-cyan-300'
+                  : 'border-white/10 text-zinc-400 hover:border-white/25 hover:text-white',
+              )}
+            >
+              <BookOpen className="w-4 h-4" aria-hidden="true" />
+            </button>
+            <button
+              type="button"
               onClick={() => setTab((t) => (t === 'settings' ? 'console' : 'settings'))}
               aria-label={tab === 'settings' ? 'Back to console' : 'Settings'}
               title={tab === 'settings' ? 'Back to console' : 'Settings'}
@@ -423,7 +445,9 @@ function Dashboard({
           )}
         </div>
 
-        {tab === 'settings' ? (
+        {tab === 'guide' ? (
+          <GuideView health={health} onBack={() => setTab('console')} backLabel="Back to console" />
+        ) : tab === 'settings' ? (
           <SettingsView
             token={token}
             fallbackUser={user}
@@ -646,12 +670,6 @@ function Dashboard({
 }
 
 /* ------------------------------------------------------------ dash cards */
-
-const ACCENTS = {
-  emerald: { text: 'text-emerald-400', ring: 'hover:border-emerald-400/40', btn: 'bg-emerald-400 text-ink-950 hover:bg-emerald-300' },
-  cyan: { text: 'text-cyan-400', ring: 'hover:border-cyan-400/40', btn: 'bg-cyan-400 text-ink-950 hover:bg-cyan-300' },
-  violet: { text: 'text-violet-400', ring: 'hover:border-violet-400/40', btn: 'bg-violet-400 text-ink-950 hover:bg-violet-300' },
-} as const;
 
 /**
  * Real VRAM headroom on the session node. The headline number moves with every
@@ -1340,14 +1358,52 @@ function AuthGate({ onAuthed, onBack }: { onAuthed: (a: Auth) => void; onBack: (
 
 /* ---------------------------------------------------------- landing page */
 
-const NAV_LINKS = [
+/** In-page anchors, plus one entry that leaves the page for the full guide.
+ *  Kept as one list so the desktop nav and the mobile menu cannot drift. */
+const NAV_LINKS: Array<{ label: string; href?: string; guide?: true }> = [
   { href: '#hardware', label: 'Hardware' },
   { href: '#pricing', label: 'Pricing' },
   { href: '#how', label: 'How it works' },
+  { label: 'Guide', guide: true },
   { href: '#faq', label: 'FAQ' },
 ];
 
-function LandingPage({ onLaunch }: { onLaunch: () => void }) {
+/** The signed-out guide, wrapped in the site's own header and footer so it is a
+ *  real destination rather than a modal bolted onto the landing page. */
+function GuidePage({ onBack, onLaunch }: { onBack: () => void; onLaunch: () => void }) {
+  const health = useHealth();
+  return (
+    <div className="min-h-screen bg-ink-950 text-zinc-100">
+      <a className="skip-link" href="#guide">Skip to the guide</a>
+
+      <header className="sticky top-0 z-40 border-b border-white/10 bg-ink-950/85 backdrop-blur-xl">
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-5 py-3.5">
+          <button type="button" onClick={onBack} aria-label="VortexGPU home" className="shrink-0">
+            <Logo />
+          </button>
+          <button type="button" onClick={onLaunch} className={cx(BTN_PRIMARY, 'px-4 py-2 text-sm')}>
+            Launch console
+          </button>
+        </div>
+      </header>
+
+      <main id="guide" className="mx-auto max-w-6xl px-5 py-8">
+        <GuideView health={health} onBack={onBack} backLabel="Back to home" onGetStarted={onLaunch} />
+      </main>
+
+      <footer className="border-t border-white/10">
+        <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-5 py-10 md:flex-row">
+          <Logo />
+          {/* No price here on purpose: the guide body already prints the live
+              figure, and a second copy would need a hardcoded fallback. */}
+          <p className="text-center text-xs text-zinc-600">Bitcoin via BTCPay · No KYC</p>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () => void }) {
   const health = useHealth();
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -1368,7 +1424,13 @@ function LandingPage({ onLaunch }: { onLaunch: () => void }) {
 
           <nav aria-label="Primary" className="hidden items-center gap-7 text-sm text-zinc-400 md:flex">
             {NAV_LINKS.map((l) => (
-              <a key={l.href} href={l.href} className="transition-colors hover:text-white">{l.label}</a>
+              l.guide ? (
+                <button key={l.label} type="button" onClick={onGuide} className="transition-colors hover:text-white">
+                  {l.label}
+                </button>
+              ) : (
+                <a key={l.label} href={l.href} className="transition-colors hover:text-white">{l.label}</a>
+              )
             ))}
           </nav>
 
@@ -1393,14 +1455,24 @@ function LandingPage({ onLaunch }: { onLaunch: () => void }) {
           <nav id="mobile-nav" aria-label="Primary mobile" className="border-t border-white/10 md:hidden">
             <ul className="mx-auto flex max-w-6xl list-none flex-col gap-1 p-3">
               {NAV_LINKS.map((l) => (
-                <li key={l.href}>
-                  <a
-                    href={l.href}
-                    onClick={() => setMenuOpen(false)}
-                    className="flex items-center justify-between rounded-lg px-3 py-2.5 text-sm text-zinc-300 hover:bg-white/5"
-                  >
-                    {l.label} <ChevronRight className="w-4 h-4 text-zinc-600" aria-hidden="true" />
-                  </a>
+                <li key={l.label}>
+                  {l.guide ? (
+                    <button
+                      type="button"
+                      onClick={() => { setMenuOpen(false); onGuide(); }}
+                      className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm text-zinc-300 hover:bg-white/5"
+                    >
+                      {l.label} <ChevronRight className="w-4 h-4 text-zinc-600" aria-hidden="true" />
+                    </button>
+                  ) : (
+                    <a
+                      href={l.href}
+                      onClick={() => setMenuOpen(false)}
+                      className="flex items-center justify-between rounded-lg px-3 py-2.5 text-sm text-zinc-300 hover:bg-white/5"
+                    >
+                      {l.label} <ChevronRight className="w-4 h-4 text-zinc-600" aria-hidden="true" />
+                    </a>
+                  )}
                 </li>
               ))}
             </ul>
@@ -1610,6 +1682,15 @@ function LandingPage({ onLaunch }: { onLaunch: () => void }) {
               </li>
             ))}
           </ol>
+
+          <div className="mt-12 flex flex-col items-center gap-3 text-center">
+            <p className="text-sm text-zinc-500">
+              Want the whole picture — what each machine type actually is, how billing works, how to connect?
+            </p>
+            <button type="button" onClick={onGuide} className={cx(BTN_GHOST, 'px-6 py-3 text-sm')}>
+              <BookOpen className="w-4 h-4" aria-hidden="true" /> Read the full guide
+            </button>
+          </div>
         </section>
 
         {/* ---- FAQ ---- */}
