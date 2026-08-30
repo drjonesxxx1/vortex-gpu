@@ -2,8 +2,8 @@ import React, { Suspense, lazy, useCallback, useEffect, useId, useMemo, useRef, 
 import { createPortal } from 'react-dom';
 import {
   Activity, ArrowRight, Bitcoin, CheckCircle2, ChevronRight, Clock,
-  Cpu, ExternalLink, Eye, EyeOff, Globe, KeyRound, Laptop, Lock,
-  LogIn, LogOut, Menu, Monitor, Power, Rocket, Server, Settings as SettingsIcon,
+  Cpu, ExternalLink, Eye, EyeOff, Globe, Laptop, Lock,
+  LogIn, LogOut, Menu, Monitor, Plug, Power, Rocket, Server, Settings as SettingsIcon,
   Shield, Terminal, Trash2, UserPlus, Wallet, X, Zap,
 } from 'lucide-react';
 import {
@@ -11,6 +11,7 @@ import {
   INPUT_CLS, Spinner, StateBadge, cx, fmtBalance, readError, useDialogChrome,
 } from './components/ui';
 import { SettingsView } from './components/SettingsView';
+import { vmEndpoint } from './connect';
 import {
   type Capacity, type Health, fmtVram, readCapacity, useHealth,
 } from './health';
@@ -43,6 +44,9 @@ const Cyber3DCanvas = lazy(() =>
 
 interface ApiVm {
   id: string; vm_id: number; os: string; sku: string; state: string;
+  /** Host address of the guest. NULL while `provisioning` — the clone writes it
+   *  at the same moment it flips the row to `running`. */
+  ip: string | null;
   port: number | null; username: string | null; password: string | null;
   app: string | null; created_at: number;
 }
@@ -864,6 +868,8 @@ function VmCard({
   const isActive = vm.state === 'running' || vm.state === 'provisioning';
   /** The server refuses to delete anything still running. */
   const removable = vm.state === 'stopped' || vm.state === 'failed';
+  /** null until the host address lands — see the waiting state below. */
+  const endpoint = vmEndpoint(vm.os, vm.ip, vm.port, vm.username);
   return (
     <article
       className={cx(
@@ -887,6 +893,7 @@ function VmCard({
       {vm.state === 'provisioning' && (
         <p className="mt-4 flex items-center gap-2 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-xs text-amber-200" aria-live="polite">
           <Spinner className="w-3.5 h-3.5" /> Cloning the template and booting — this takes a couple of minutes.
+          Connection details appear here the moment it is running.
         </p>
       )}
       {(vm.state === 'stopping' || vm.state === 'stopped') && (
@@ -906,10 +913,27 @@ function VmCard({
         <div className="mt-4 space-y-2">
           <div className="flex items-center justify-between rounded-lg border border-white/10 bg-black/40 px-2.5 py-1.5 font-mono text-[11px]">
             <span className="flex items-center gap-1.5 text-zinc-500">
-              <KeyRound className="w-3.5 h-3.5" aria-hidden="true" /> {isWin ? 'RDP' : 'SSH'}
+              <Plug className="w-3.5 h-3.5" aria-hidden="true" /> {endpoint?.protocol ?? (isWin ? 'RDP' : 'SSH')}
             </span>
             <span className="text-cyan-300">port {vm.port ?? '—'}</span>
           </div>
+          {/* `ip` is written when the clone finishes. A row that reports
+           *  `running` normally has one, but a drifted row might not — so the
+           *  address is rendered from the endpoint or not at all, never as the
+           *  string "null". */}
+          {endpoint ? (
+            <>
+              <CopyField label="host" value={endpoint.address} />
+              <CopyField label={isWin ? 'rdp' : 'ssh'} value={endpoint.command} />
+            </>
+          ) : (
+            <p
+              className="flex items-center gap-2 rounded-lg border border-amber-400/25 bg-amber-400/5 px-2.5 py-2 text-[11px] text-amber-200"
+              aria-live="polite"
+            >
+              <Spinner className="w-3.5 h-3.5" /> Waiting for the host address — it appears as soon as the host reports it.
+            </p>
+          )}
           {vm.username && <CopyField label="user" value={vm.username} />}
           {vm.password && <CopyField label="pass" value={vm.password} secret />}
           <p className="flex items-center gap-1.5 text-[11px] text-zinc-500">
