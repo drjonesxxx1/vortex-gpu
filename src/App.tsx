@@ -519,7 +519,7 @@ function Dashboard({
               accent="emerald"
               name="Ubuntu GPU Session"
               tag="In-browser desktop"
-              desc="A full Ubuntu desktop streamed to your browser with the GPU attached. Install anything, run any CUDA job."
+              desc="A full Ubuntu desktop streamed to your browser, with the GPU attached. Install anything and run CUDA jobs. The card is shared, so check the VRAM headroom above before a heavy run."
               cta="Spawn session"
               onClick={spawnSession}
               busy={busy === 'session'}
@@ -532,7 +532,7 @@ function Dashboard({
               accent="cyan"
               name="Windows 10"
               tag="RDP · full desktop"
-              desc="A real Windows 10 VM over RDP. Games, GUI apps and CUDA workloads on a genuine desktop."
+              desc="A real Windows 10 VM over RDP with administrator access. GUI apps and general compute — CPU and RAM only, no GPU attached."
               cta="Deploy Windows"
               onClick={() => deployVm('windows')}
               busy={busy === 'windows'}
@@ -1550,7 +1550,7 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
             {[
               [`$${price}`, 'per hour, per machine'],
               [`${freeMachines}`, `machine${freeMachines === 1 ? '' : 's'} free, always`],
-              ['4080 SUPER', 'dedicated passthrough'],
+              ['4080 SUPER', 'shared — live headroom shown'],
             ].map(([v, l]) => (
               <div key={l}>
                 <div className="font-mono text-2xl font-black text-cyan-300 md:text-3xl">{v}</div>
@@ -1583,7 +1583,7 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
           <SectionHead
             eyebrow="Three ways to compute"
             title="One GPU, whichever interface you want"
-            sub="Every machine is a real isolated instance with the GPU attached — not a shared sandbox or a queued batch job."
+            sub="Every machine is a real isolated instance, not a queued batch job. The GPU is attached to the Ubuntu session; the Windows and Linux VMs are CPU and RAM only."
           />
           <div className="grid gap-5 md:grid-cols-3">
             <FeatureCard
@@ -1594,21 +1594,21 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
             <FeatureCard
               icon={<Laptop className="w-6 h-6" aria-hidden="true" />} accent="cyan"
               name="Windows 10" tag="RDP · full desktop"
-              desc="A real Windows 10 VM over RDP with administrator access. Games, GUI applications and CUDA workloads on a genuine desktop."
+              desc="A real Windows 10 VM over RDP with administrator access. GUI applications and general compute on a genuine desktop — CPU and RAM only, no GPU attached."
             />
             <FeatureCard
               icon={<Server className="w-6 h-6" aria-hidden="true" />} accent="violet"
               name="Linux" tag="SSH · headless"
-              desc="Debian over SSH with root. Docker, training runs and long-lived server jobs, without a desktop in the way."
+              desc="Debian over SSH with root. Docker and long-lived server jobs, without a desktop in the way. CPU and RAM only — for GPU work use the Ubuntu session."
             />
           </div>
 
           <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             {[
-              [<Cpu key="i" className="w-5 h-5 text-cyan-400" aria-hidden="true" />, 'Dedicated GPU', 'Real passthrough — the card is yours for the session'],
+              [<Cpu key="i" className="w-5 h-5 text-cyan-400" aria-hidden="true" />, 'Real GPU', 'A physical RTX 4080 SUPER, shared — live headroom shown before you deploy'],
               [<Shield key="i" className="w-5 h-5 text-emerald-400" aria-hidden="true" />, 'No KYC', 'Username, password, Bitcoin. Nothing else collected'],
               [<Globe key="i" className="w-5 h-5 text-violet-400" aria-hidden="true" />, 'Clean egress', 'Sessions get a residential proxy when the pool has one'],
-              [<Lock key="i" className="w-5 h-5 text-amber-400" aria-hidden="true" />, 'Isolated', 'Your own VM with full root, destroyed on stop'],
+              [<Lock key="i" className="w-5 h-5 text-amber-400" aria-hidden="true" />, 'Isolated', 'Your own instance with full root. Stop halts billing; delete reclaims it'],
             ].map(([ic, t, d]) => (
               <div key={String(t)} className="surface rounded-xl p-4">
                 <div className="flex items-center gap-2 text-sm font-semibold text-zinc-100">{ic}{t}</div>
