@@ -373,9 +373,9 @@ export function GuideView({
               t: 'Delete to clear it',
               d: (
                 <>
-                  <strong className="text-zinc-200">Delete</strong> removes the machine for good and reclaims it on the
-                  host, along with anything left on its disk. It is only offered for a stopped or failed machine —
-                  a running one has to be stopped first.
+                  <strong className="text-zinc-200">Delete</strong> removes the machine from your console for good and
+                  releases it on the host, taking anything left on its disk with it. It is only offered for a stopped
+                  or failed machine — a running one has to be stopped first.
                 </>
               ),
             },
