@@ -545,7 +545,7 @@ function Dashboard({
               accent="violet"
               name="Linux"
               tag="SSH · headless"
-              desc="Debian over SSH for headless compute, Docker and long-running server jobs."
+              desc="Debian 12 over SSH for headless compute, Docker and long-running server jobs — CPU and RAM only, no GPU attached."
               cta="Deploy Linux"
               onClick={() => deployVm('linux')}
               busy={busy === 'linux'}
@@ -1599,7 +1599,7 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
             <FeatureCard
               icon={<Server className="w-6 h-6" aria-hidden="true" />} accent="violet"
               name="Linux" tag="SSH · headless"
-              desc="Debian over SSH with root. Docker and long-lived server jobs, without a desktop in the way. CPU and RAM only — for GPU work use the Ubuntu session."
+              desc="Debian 12 over SSH with root. Docker and long-lived server jobs, without a desktop in the way. CPU and RAM only — for GPU work use the Ubuntu session."
             />
           </div>
 
