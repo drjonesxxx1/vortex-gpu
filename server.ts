@@ -1299,6 +1299,24 @@ ${opts.refreshSec ? `<div class="note">Retrying automatically every ${opts.refre
   runReconcile();
   setInterval(runReconcile, VM_RECONCILE_MS);
 
+  // Confirm the configured templates actually exist and are templates. Without
+  // this a typo'd VMID only surfaces when a tenant provisions: the clone fails
+  // in the background and their machine lands in `failed` with no operator
+  // signal. Non-blocking and advisory -- a hypervisor that is briefly
+  // unreachable must not stop the gateway from serving.
+  void (async () => {
+    for (const [label, vmid] of [["windows", PVE_TEMPLATE_WIN], ["linux", PVE_TEMPLATE_LINUX]] as const) {
+      const r = await pve(["qm", "config", String(vmid)]);
+      if (!r.ok) { console.warn(`[templates] could not verify ${label} template ${vmid}: ${r.out.slice(0, 120).trim()}`); continue; }
+      const name = r.out.match(/^name:\s*(.+)$/m)?.[1]?.trim() ?? "?";
+      if (!/^template:\s*1\s*$/m.test(r.out)) {
+        console.error(`[templates] ${label} template ${vmid} ("${name}") is NOT a template — cloning it will fail`);
+      } else {
+        console.log(`[templates] ${label} -> ${vmid} "${name}" ok`);
+      }
+    }
+  })();
+
   const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`[VortexGPU] rent-a-PC gateway on :${PORT}`);
     console.log(`[VortexGPU] Proxmox ${PVE_HOST} | win tpl ${PVE_TEMPLATE_WIN} | linux tpl ${PVE_TEMPLATE_LINUX}`);
