@@ -17,6 +17,12 @@ export interface Health {
    *  free VRAM genuinely moves — these are polled values, not constants.
    *  Optional because an older gateway may not send them yet; the UI then
    *  degrades to "capacity unknown" rather than inventing a number. */
+  /** Names for the guest each Proxmox template actually produces. Optional so an
+   *  older gateway degrades to the generic fallback rather than rendering
+   *  `undefined`; never hardcode a version in the UI, or swapping the template
+   *  silently makes the storefront advertise an OS tenants do not get. */
+  windowsLabel?: string;
+  linuxLabel?: string;
   sessionNode?: string;
   sessionNodeOnline?: boolean;
   gpuVramFreeMb?: number;

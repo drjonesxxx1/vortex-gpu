@@ -54,6 +54,12 @@ const PVE_USER = process.env.PVE_USER || "root";
 const PVE_TEMPLATE_WIN = Number(process.env.PVE_TEMPLATE_WIN) || 504;
 const PVE_TEMPLATE_LINUX = Number(process.env.PVE_TEMPLATE_LINUX) || 990;
 const PVE_VMID_START = Number(process.env.PVE_VMID_START) || 2000;
+// Names shown to tenants for the guest each template actually produces. The UI
+// reads these from /api/health rather than hardcoding a version, so swapping
+// PVE_TEMPLATE_WIN/LINUX to a different image cannot leave the storefront
+// advertising an OS the tenant does not get.
+const WINDOWS_LABEL = process.env.WINDOWS_LABEL || "Windows";
+const LINUX_LABEL = process.env.LINUX_LABEL || "Linux";
 
 // ---- BTCPay ----
 const BTCPAY_URL = process.env.BTCPAY_URL || "https://10.30.20.140";
@@ -618,6 +624,8 @@ async function startServer() {
       // implying the full card is free.
       // Report the SESSION node specifically. Aggregating across the fleet
       // advertised a Windows node's headroom for a Linux-only capability.
+      windowsLabel: WINDOWS_LABEL,
+      linuxLabel: LINUX_LABEL,
       sessionNode: SESSION_NODE,
       sessionNodeOnline: !!sessionNode && now - sessionNode.lastSeen < NODE_ONLINE_MS,
       gpuVramFreeMb: sessionNode ? Math.max(0, (sessionNode.memTotalMb || 0) - (sessionNode.memUsedMb || 0)) : 0,

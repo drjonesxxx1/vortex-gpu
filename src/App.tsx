@@ -342,6 +342,11 @@ function Dashboard({
    *  Windows/Linux VM cards keep the account-level `blocked` rule alone. */
   const capacity = readCapacity(health);
   const sessionBlocked = blocked ?? capacity.sessionBlocked;
+  /** Guest names come from the gateway, which derives them from the templates
+   *  actually configured. Hardcoding a version here means swapping a template
+   *  silently leaves the storefront advertising an OS tenants do not get. */
+  const winLabel = health?.windowsLabel || 'Windows';
+  const linLabel = health?.linuxLabel || 'Linux';
 
   return (
     <div className="min-h-screen bg-ink-950 text-zinc-100">
@@ -530,9 +535,9 @@ function Dashboard({
             <ProductCard
               icon={<Laptop className="w-6 h-6" aria-hidden="true" />}
               accent="cyan"
-              name="Windows 10"
+              name={winLabel}
               tag="RDP · full desktop"
-              desc="A real Windows 10 VM over RDP with administrator access. GUI apps and general compute — CPU and RAM only, no GPU attached."
+              desc={`A real ${winLabel} VM over RDP with administrator access. GUI apps and general compute — CPU and RAM only, no GPU attached.`}
               cta="Deploy Windows"
               onClick={() => deployVm('windows')}
               busy={busy === 'windows'}
@@ -621,12 +626,14 @@ function Dashboard({
                 <li key={vm.id}>
                   <VmCard
                     vm={vm}
+                    winLabel={winLabel}
+                    linLabel={linLabel}
                     now={nowTs}
                     busy={busy === `d:${vm.id}`}
                     deleting={busy === `x:${vm.id}`}
                     disabled={!!busy}
                     onStop={() => destroyVm(vm.id)}
-                    onDelete={() => askDelete('vm', vm.id, `${vm.os === 'windows' ? 'Windows 10' : 'Linux'} machine #${vm.vm_id}`)}
+                    onDelete={() => askDelete('vm', vm.id, `${vm.os === 'windows' ? winLabel : linLabel} machine #${vm.vm_id}`)}
                   />
                 </li>
               ))}
@@ -877,10 +884,12 @@ function SessionCard({
 }
 
 function VmCard({
-  vm, now, busy, deleting, disabled, onStop, onDelete,
+  vm, now, busy, deleting, disabled, onStop, onDelete, winLabel, linLabel,
 }: {
   vm: ApiVm; now: number; busy: boolean; deleting: boolean;
   disabled: boolean; onStop: () => void; onDelete: () => void;
+  /** Guest names from /api/health — see the note where they are derived. */
+  winLabel: string; linLabel: string;
 }) {
   const isWin = vm.os === 'windows';
   const isActive = vm.state === 'running' || vm.state === 'provisioning';
@@ -901,7 +910,7 @@ function VmCard({
             {isWin ? <Laptop className="w-4 h-4" aria-hidden="true" /> : <Server className="w-4 h-4" aria-hidden="true" />}
           </span>
           <div className="min-w-0">
-            <h3 className="truncate font-semibold">{isWin ? 'Windows 10' : 'Linux'}</h3>
+            <h3 className="truncate font-semibold">{isWin ? winLabel : linLabel}</h3>
             <p className="truncate font-mono text-[11px] text-zinc-500">#{vm.vm_id} · {vm.sku}</p>
           </div>
         </div>
@@ -1411,6 +1420,10 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
   const freeMachines = health?.freeMachines ?? 1;
   const maxMachines = health?.maxVmsPerUser ?? 3;
   const gpuSku = health?.gpuSku ?? 'NVIDIA GeForce RTX 4080 SUPER 16GB';
+  /** See the dashboard note: guest names come from the gateway so that swapping
+   *  a Proxmox template cannot leave this page advertising the wrong OS. */
+  const winLabel = health?.windowsLabel || 'Windows';
+  const linLabel = health?.linuxLabel || 'Linux';
   const capacity = readCapacity(health);
 
   return (
@@ -1593,8 +1606,8 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
             />
             <FeatureCard
               icon={<Laptop className="w-6 h-6" aria-hidden="true" />} accent="cyan"
-              name="Windows 10" tag="RDP · full desktop"
-              desc="A real Windows 10 VM over RDP with administrator access. GUI applications and general compute on a genuine desktop — CPU and RAM only, no GPU attached."
+              name={winLabel} tag="RDP · full desktop"
+              desc={`A real ${winLabel} VM over RDP with administrator access. GUI applications and general compute on a genuine desktop — CPU and RAM only, no GPU attached.`}
             />
             <FeatureCard
               icon={<Server className="w-6 h-6" aria-hidden="true" />} accent="violet"
