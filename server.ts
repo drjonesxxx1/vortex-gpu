@@ -130,7 +130,62 @@ function saveJson(f: string, d: unknown) { fs.mkdirSync(DATA_DIR, { recursive: t
 const nodes: Record<string, GpuNode> = loadJson(NODES_FILE, {});
 const jobs: GpuJob[] = loadJson(JOBS_FILE, []);
 function persistNodes() { saveJson(NODES_FILE, nodes); }
-function persistJobs() { saveJson(JOBS_FILE, jobs); }
+
+// persistJobs() is a synchronous whole-file write on the single-threaded event
+// loop, and it is called on every job-result POST *and* every node job poll. At
+// MAX_JOBS(500) x the 64KB per-result cap that is a 32MB JSON.stringify plus a
+// 32MB writeFileSync per poll — every node poll would stall the entire gateway.
+// jobs.json is only ~20KB today, so this is latent, but a handful of large
+// shell/hashcat results is all it takes.
+//
+// Two bounds, neither of which loses history the admin UI reads (it renders
+// jobs.slice(-50)):
+//   1. Only the most recent JOB_FULL_RESULT_KEEP jobs keep their full result.
+//      Older ones are compacted in place — the job, its status, its timestamps
+//      and the head of its output all survive; only the tail of a large body is
+//      dropped, and the entry says so.
+//   2. Writes are debounced, so a burst of polls and results costs one write.
+const JOB_FULL_RESULT_KEEP = 50;
+const JOB_ARCHIVED_RESULT_MAX = 2048;
+const JOB_TRUNC_MARK = "\n… [result truncated]";
+const JOB_PERSIST_DEBOUNCE_MS = 500;
+
+function compactOldJobResults(): void {
+  const cut = jobs.length - JOB_FULL_RESULT_KEEP;
+  for (let i = 0; i < cut; i++) {
+    const j = jobs[i];
+    // endsWith() keeps this idempotent, so repeated passes cannot nibble a
+    // result away a slice at a time.
+    if (j.result.length > JOB_ARCHIVED_RESULT_MAX && !j.result.endsWith(JOB_TRUNC_MARK)) {
+      j.result = j.result.slice(0, JOB_ARCHIVED_RESULT_MAX) + JOB_TRUNC_MARK;
+    }
+  }
+}
+
+let jobsDirty = false;
+let jobsTimer: NodeJS.Timeout | null = null;
+function flushJobs(): void {
+  if (jobsTimer) { clearTimeout(jobsTimer); jobsTimer = null; }
+  if (!jobsDirty) return;
+  jobsDirty = false;
+  compactOldJobResults();
+  saveJson(JOBS_FILE, jobs);
+}
+function persistJobs(): void {
+  jobsDirty = true;
+  if (jobsTimer) return;
+  jobsTimer = setTimeout(() => { jobsTimer = null; flushJobs(); }, JOB_PERSIST_DEBOUNCE_MS);
+  // Never hold the process open just to write the job log.
+  jobsTimer.unref?.();
+}
+// A debounce window is only safe if shutdown drains it: deploy.sh restarts the
+// service, and losing the last write would leave a completed job recorded as
+// still running. Both handlers exit explicitly so installing them cannot stop
+// the service from terminating on a deploy.
+process.on("exit", () => { try { flushJobs(); } catch { /* best effort */ } });
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+  process.once(sig, () => { try { flushJobs(); } catch { /* best effort */ } process.exit(0); });
+}
 
 // A node is "online" if it phoned home in the last 30s — that short window drives
 // spawn eligibility and the admin online/offline badge and is deliberately left
