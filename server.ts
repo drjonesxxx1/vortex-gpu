@@ -1256,7 +1256,13 @@ async function startServer() {
     const command = str(req.body?.command, "");
     if (!hostname || !command) return res.status(400).json({ error: "hostname and command required" });
     if (command.length > 4096) return res.status(400).json({ error: "command too long" });
-    if (!nodes[hostname]) return res.status(404).json({ error: "unknown node" });
+    // `nodes` is a plain object, so nodes["__proto__"] is Object.prototype —
+    // truthy — and sailed straight past the unknown-node check below, queueing a
+    // shell job for a host that does not exist. /api/node/register and
+    // /api/node/report already gate on validHost() for exactly this reason; this
+    // read did not. Admin-gated, so low impact, but it costs one line to close.
+    if (!validHost(hostname)) return res.status(400).json({ error: "hostname and command required" });
+    if (!Object.prototype.hasOwnProperty.call(nodes, hostname)) return res.status(404).json({ error: "unknown node" });
     console.warn(`[admin] shell job dispatched to ${hostname} from ${clientIp(req)}`);
     const job: GpuJob = { id: "job_" + crypto.randomBytes(6).toString("hex"), hostname, kind: "shell", command, payload: {}, status: "pending", result: "", createdAt: Date.now(), completedAt: null };
     jobs.push(job); trimJobs(); persistJobs();
