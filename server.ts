@@ -1107,12 +1107,18 @@ async function startServer() {
     job.status = req.body?.ok ? "done" : "failed";
     job.result = String(req.body?.result ?? "").slice(0, 64 * 1024); // bound jobs.json growth
     job.completedAt = Date.now();
-    // Reflect provisioning result onto the session row.
+    // Reflect the job result onto the session row, but ONLY if the row is still
+    // in the state this job was dispatched from. Job results arrive out of
+    // order: destroying a session while it is still provisioning made the
+    // destroy write 'stopped' and the older provision_ubuntu result then write
+    // 'running' over it, leaving the row billed for a container that no longer
+    // exists (and the reverse ordering recorded a live container as stopped).
+    // The state predicate makes each update a no-op once the row has moved on.
     const p = job.payload as any;
     if (job.kind === "provision_ubuntu" && p?.instanceId) {
-      q("UPDATE sessions SET state=? WHERE instance_id=?", req.body?.ok ? "running" : "failed", p.instanceId);
+      q("UPDATE sessions SET state=? WHERE instance_id=? AND state='provisioning'", req.body?.ok ? "running" : "failed", p.instanceId);
     } else if (job.kind === "destroy_ubuntu" && p?.instanceId) {
-      q("UPDATE sessions SET state='stopped' WHERE instance_id=?", p.instanceId);
+      q("UPDATE sessions SET state='stopped' WHERE instance_id=? AND state='stopping'", p.instanceId);
     }
     persistJobs();
     res.json({ ok: true });
