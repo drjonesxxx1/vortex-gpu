@@ -1055,7 +1055,18 @@ async function startServer() {
     const sess = one<any>("SELECT * FROM sessions WHERE id=? AND user_id=?", sessionId, user.id);
     if (!sess) return res.status(404).json({ error: "not found" });
     if (!DELETABLE_STATES.includes(String(sess.state))) return res.status(409).json({ error: "stop the machine first" });
+    // Reclaim BEFORE dropping the row, mirroring /api/vms/delete. The row is the
+    // only handle on the container: a 'failed' session is exactly the case where
+    // the node may have half-created or fully created one, and deleting the row
+    // left it running unbilled on the GPU box, holding VRAM that the
+    // MIN_FREE_VRAM_MB preflight then refuses other customers on.
+    // Unlike the VM path this cannot be confirmed synchronously — the node layer
+    // is a job queue, not an RPC — so the job is enqueued (durably, in jobs.json)
+    // and the row goes. destroy_ubuntu on an instance that is already gone is a
+    // no-op on the node, so re-issuing it for a 'stopped' row is harmless.
+    dispatchJob(sess.node_hostname, "destroy_ubuntu", "", { instanceId: sess.instance_id });
     q("DELETE FROM sessions WHERE id=? AND user_id=? AND state IN ('stopped','failed')", sess.id, user.id);
+    console.log(`[sessions] dispatched destroy_ubuntu for ${sess.instance_id} and removed row ${sess.id}`);
     res.json({ ok: true });
   });
 
