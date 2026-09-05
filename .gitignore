@@ -10,5 +10,6 @@ data/*.db-wal
 *.finbak
 src.bak.*
 data/*.json
+data/*.partial
 !data/.gitkeep
 dist.rollback-*/
