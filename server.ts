@@ -632,9 +632,36 @@ function btcpay(method: string, apiPath: string, body?: unknown): Promise<{ stat
 async function startServer() {
   const app = express();
   app.set("trust proxy", TRUST_PROXY);
+  // Body parsing runs BEFORE every per-route rateLimit(), so the parse cost is
+  // paid by anonymous callers on unauthenticated routes and a 429 never refunds
+  // it. A global 10mb limit therefore let anyone make the single-threaded event
+  // loop chew through 10MB of JSON per request, as fast as they could send it.
+  //
+  // Nothing legitimate needs anything close to that. Every request body here is
+  // a handful of short fields; the one exception is a node job result, which the
+  // handler itself already caps at 64KB, so that path (and only that path) gets
+  // a larger parser with headroom for JSON escaping. The webhook keeps
+  // express.raw at its default 100kb — BTCPay invoice payloads are a few KB, and
+  // the HMAC must cover the exact bytes, so it must not be parsed as JSON.
+  const jsonSmall = express.json({ limit: "64kb" });
+  const jsonJobResult = express.json({ limit: "1mb" });
+  const rawWebhook = express.raw({ type: "application/json" });
+  const JOB_RESULT_PATH_RE = /^\/api\/node\/jobs\/[^/]+\/result\/?$/;
   app.use((req, res, next) => {
-    if (req.method === "POST" && req.path === "/api/btcpay/webhook") return express.raw({ type: "application/json" })(req, res, next);
-    express.json({ limit: "10mb" })(req, res, next);
+    if (req.method === "POST" && req.path === "/api/btcpay/webhook") return rawWebhook(req, res, next);
+    if (req.method === "POST" && JOB_RESULT_PATH_RE.test(req.path)) return jsonJobResult(req, res, next);
+    jsonSmall(req, res, next);
+  });
+
+  // body-parser's own errors (over the limit, malformed JSON, bad charset) are
+  // otherwise rendered as an HTML error page. Answer in the `{error:"..."}`
+  // shape the rest of the API uses so a client can actually read them — and so
+  // the stricter limit above reports itself clearly rather than as a mystery.
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (!err || typeof err.type !== "string" || res.headersSent) return next(err);
+    if (err.type === "entity.too.large") return res.status(413).json({ error: "request body too large" });
+    if (err.type === "entity.parse.failed") return res.status(400).json({ error: "invalid JSON body" });
+    return res.status(400).json({ error: "bad request body" });
   });
 
   // Dashboard/API responses are never cached (live state must always be fresh).
