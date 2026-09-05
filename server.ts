@@ -281,6 +281,23 @@ function verifyPassword(pw: string, stored: string): boolean {
   } catch { return false; }
 }
 
+// Usernames are case-insensitive. They were compared with a plain `=`, so
+// `DrJones` could be registered alongside `drjones`: on a product where the
+// username is the whole of a tenant's identity, that is a ready-made
+// impersonation vector (and it made the free-machine-per-account limit easier
+// to dress up as someone else).
+//
+// New rows are stored lowercase. Existing rows are deliberately NOT rewritten —
+// a boot-time migration that collided two rows on the UNIQUE index would take
+// the gateway down — so every lookup tries the literal value first and then a
+// case-insensitive match. That leaves any pre-existing mixed-case account able
+// to log in exactly as before, under either casing.
+function normUsername(v: unknown): string { return str(v, "").toLowerCase(); }
+function findUserByUsername(username: string): any | undefined {
+  return one<any>("SELECT * FROM users WHERE username=?", username)
+    ?? one<any>("SELECT * FROM users WHERE username=? COLLATE NOCASE", username);
+}
+
 // Seed the owner account (username: drjones, unlimited machines).
 // Password comes from OWNER_SEED_PASSWORD; seeding is skipped if unset.
 (function seedOwner() {
@@ -778,11 +795,15 @@ async function startServer() {
     if (!/^[a-zA-Z0-9_.-]{3,32}$/.test(username)) return res.status(400).json({ error: "username must be 3-32 chars (letters, numbers, _ . -)" });
     if (password.length < 6) return res.status(400).json({ error: "password must be at least 6 chars" });
     if (password.length > MAX_PASSWORD_LEN) return res.status(400).json({ error: `password must be at most ${MAX_PASSWORD_LEN} chars` });
-    if (one<any>("SELECT id FROM users WHERE username=?", username)) return res.status(409).json({ error: "username already taken" });
+    // Case-insensitive uniqueness, and stored lowercase. The charset check above
+    // still runs against what was typed. NOTE: the account (and the `username`
+    // echoed back in this response) is the lowercased form.
+    const stored = normUsername(username);
+    if (one<any>("SELECT id FROM users WHERE username=? COLLATE NOCASE", stored)) return res.status(409).json({ error: "username already taken" });
 
     const id = "usr_" + crypto.randomBytes(8).toString("hex");
     q("INSERT INTO users (id,username,balance_minutes,btc_address,created_at,password_hash,unlimited) VALUES (?,?,?,?,?,?,?)",
-      id, username, 0, "bc1q" + crypto.randomBytes(16).toString("hex"), Date.now(), hashPassword(password), 0);
+      id, stored, 0, "bc1q" + crypto.randomBytes(16).toString("hex"), Date.now(), hashPassword(password), 0);
     const user = one<any>("SELECT * FROM users WHERE id=?", id);
     res.json({ token: issueToken(id), user: publicUser(user) });
   });
@@ -799,7 +820,7 @@ async function startServer() {
     // Bound scrypt work before doing any: an unbounded password is a cheap way to
     // block the single-threaded event loop.
     if (!username || password.length > MAX_PASSWORD_LEN) return res.status(400).json({ error: "invalid credentials" });
-    const user = one<any>("SELECT * FROM users WHERE username=?", username);
+    const user = findUserByUsername(username);
     if (!user) return res.status(401).json({ error: "no account with that username" });
     // A NULL/blank password_hash is a legacy account with NO credential set. It
     // must NOT be claimable: previously the first login silently adopted whatever
@@ -1285,7 +1306,7 @@ async function startServer() {
     if (newPassword.length > MAX_PASSWORD_LEN) return res.status(400).json({ error: `password must be at most ${MAX_PASSWORD_LEN} chars` });
     const user = userId
       ? one<any>("SELECT * FROM users WHERE id=?", userId)
-      : one<any>("SELECT * FROM users WHERE username=?", username);
+      : findUserByUsername(username);
     if (!user) return res.status(404).json({ error: "user not found" });
 
     q("UPDATE users SET password_hash=? WHERE id=?", hashPassword(newPassword), user.id);
