@@ -292,7 +292,16 @@ async function reconcileVms(): Promise<void> {
   }
   if (onHost.size === 0) { console.warn("[reconcile] no parseable guests; skipping"); return; }
   const cutoff = Date.now() - VM_RECONCILE_MIN_AGE_MS;
-  const rows = all<any>("SELECT id, vm_id, state, created_at FROM vms WHERE state NOT IN ('provisioning','stopping')");
+  // Every row is eligible, including 'provisioning' and 'stopping'. Those two
+  // used to be excluded on the assumption that an in-process handler would
+  // always move them on, but the only thing that does is cloneVm().then() /
+  // the second write in /api/vms/destroy — both of which die with the process.
+  // A deploy (or a crash) during a clone therefore stranded the row in
+  // 'provisioning' forever: never billed, never cleaned, and permanently
+  // holding one of the user's machine slots. The MIN_AGE cutoff below is what
+  // protects a genuinely in-flight clone; past it, the row is abandoned by
+  // definition and `qm list` is the truth. Still only ever UPDATEs `state`.
+  const rows = all<any>("SELECT id, vm_id, state, created_at FROM vms");
   let fixed = 0;
   for (const row of rows) {
     if (Number(row.created_at) > cutoff) continue;
