@@ -750,8 +750,18 @@ async function startServer() {
     });
   });
 
-  app.get("/api/proxy/pool", (_req, res) => {
-    res.json({ count: proxyPool.length, proxies: proxyPool.slice(0, 20).map((p) => ({ ip: p.ip, location: p.location, latencyMs: p.latencyMs, anonymity: p.anonymity })) });
+  // This published the exact egress proxy IPs handed to tenant sessions, to
+  // anyone, unauthenticated. For a product sold on anonymity that is a
+  // deanonymisation aid: the set of IPs a tenant's traffic can be leaving from
+  // was a public list. Require an account AND drop the `ip` field — the pool
+  // size, locations and latencies are the only parts a tenant has any use for,
+  // and a tenant's own assigned proxy is already on their session row.
+  // RESPONSE SHAPE CHANGE: `proxies[].ip` is gone, and the route now 401s when
+  // unauthenticated. Nothing in src/ consumes this route; the admin surface
+  // reads the pool from /api/admin/state, which is unchanged.
+  app.get("/api/proxy/pool", (req, res) => {
+    if (!userFromReq(req)) return res.status(401).json({ error: "not authenticated" });
+    res.json({ count: proxyPool.length, proxies: proxyPool.slice(0, 20).map((p) => ({ location: p.location, latencyMs: p.latencyMs, anonymity: p.anonymity })) });
   });
 
   // ===== AUTH (register / login / logout) =====
