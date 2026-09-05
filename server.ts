@@ -270,8 +270,15 @@ async function stopVm(vmid: number): Promise<{ ok: boolean; out: string }> {
 // Reclaim a guest and its disks when a tenant deletes their machine. Without
 // this, delete removed only the DB row and left a real KVM guest (up to 250GB
 // for a Windows clone) stranded on the host forever -- untracked and unbilled.
+// NO --skiplock. That flag deliberately bypasses the guest lock Proxmox holds
+// during a clone/backup/migrate, so a destroy racing one of those could tear
+// down a half-written guest and leave corrupt state behind. A locked guest must
+// surface as a failed reclaim — which /api/vms/delete already turns into a 502
+// that keeps the row for retry — not be forced through. --purge is kept: it is
+// what removes the disks and the firewall/replication references, and is the
+// whole point of the reclaim.
 async function reclaimVm(vmid: number): Promise<{ ok: boolean; out: string }> {
-  return pve(["qm", "destroy", String(vmid), "--purge", "--skiplock"]);
+  return pve(["qm", "destroy", String(vmid), "--purge"]);
 }
 
 // How often to re-read the host and correct drifted vm rows, and how old a row
@@ -838,9 +845,11 @@ async function startServer() {
     const vm = one<any>("SELECT * FROM vms WHERE id=? AND user_id=?", str(vmId, ""), user.id);
     if (!vm) return res.status(404).json({ error: "not found" });
     // A clone in flight cannot be stopped safely: `qm shutdown` races the clone,
-    // and walking the row to `stopped` would let it be deleted (qm destroy
-    // --skiplock) while the background clone is still writing, orphaning a real
-    // guest the gateway no longer tracks.
+    // and walking the row to `stopped` would let it be deleted while the
+    // background clone is still writing. (The reclaim no longer passes
+    // --skiplock, so such a destroy now fails on the guest lock rather than
+    // forcing through — but the row would still be walked into a state it has
+    // no business being in, so refuse here as well.)
     if (vm.state === "provisioning") return res.status(409).json({ error: "still provisioning — wait for it to finish before stopping" });
     if (vm.state === "stopping") return res.status(409).json({ error: "already stopping" });
     if (vm.state === "stopped" || vm.state === "failed") return res.json({ ok: true });
