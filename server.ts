@@ -319,7 +319,9 @@ async function vmStatus(vmid: number): Promise<string> {
 const VM_PORT_MIN = 30000;
 const VM_PORT_MAX = 49999;
 function allocatePort(): number | null {
-  const used = new Set(all<{ port: number }>("SELECT port FROM vms WHERE port IS NOT NULL").map((r) => r.port));
+  // Same leak as the session pool, just with 20k ports instead of 101 -- far
+  // less acute, identical cause. A terminal row does not hold a port.
+  const used = new Set(all<{ port: number }>(`SELECT port FROM vms WHERE port IS NOT NULL AND state IN ${LIVE_STATES}`).map((r) => r.port));
   const span = VM_PORT_MAX - VM_PORT_MIN + 1;
   const start = Math.floor(Math.random() * span);
   for (let i = 0; i < span; i++) {
@@ -347,7 +349,11 @@ function desktopUrlFor(instanceId: string, password: string): string {
 const SESSION_PORT_MIN = 6090;
 const SESSION_PORT_MAX = 6190;
 function allocateSessionPort(): number | null {
-  const used = new Set(all<{ port: number }>("SELECT port FROM sessions WHERE port IS NOT NULL").map((r) => r.port));
+  // Only LIVE sessions hold a port. Counting terminal rows too meant a stopped
+  // or failed session reserved its port forever, and 101 such rows -- trivially
+  // created -- permanently broke session spawning for every user on the
+  // platform until someone hand-edited the database.
+  const used = new Set(all<{ port: number }>(`SELECT port FROM sessions WHERE port IS NOT NULL AND state IN ${LIVE_STATES}`).map((r) => r.port));
   for (let p = SESSION_PORT_MIN; p <= SESSION_PORT_MAX; p++) if (!used.has(p)) return p;
   return null;
 }
@@ -493,9 +499,18 @@ function assignProxy(): PoolProxy | null {
 }
 
 // Count a user's active machines (VMs + sessions) for the free-slot / cap.
+// States in which a real host resource (a Proxmox guest, a GPU container) is
+// alive and therefore occupies one of the user's machine slots. `stopping` MUST
+// be included: `qm shutdown` can block for its full timeout, and until it
+// returns the guest is still running. Excluding it let a user provision and
+// immediately "destroy" in a loop -- each iteration freed the slot while the
+// background clone kept going, bypassing MAX_VMS_PER_USER entirely and filling
+// the hypervisor with unbilled guests.
+const LIVE_STATES = "('provisioning','running','stopping')";
+
 function countActive(userId: string): number {
-  const v = one<{ c: number }>("SELECT COUNT(*) as c FROM vms WHERE user_id=? AND state IN ('running','provisioning')", userId);
-  const s = one<{ c: number }>("SELECT COUNT(*) as c FROM sessions WHERE user_id=? AND state IN ('running','provisioning')", userId);
+  const v = one<{ c: number }>(`SELECT COUNT(*) as c FROM vms WHERE user_id=? AND state IN ${LIVE_STATES}`, userId);
+  const s = one<{ c: number }>(`SELECT COUNT(*) as c FROM sessions WHERE user_id=? AND state IN ${LIVE_STATES}`, userId);
   return (v?.c || 0) + (s?.c || 0);
 }
 
@@ -757,7 +772,13 @@ async function startServer() {
   });
 
   // ===== VM PROVISIONING (real KVM clone) =====
-  app.post("/api/vms/provision", async (req, res) => {
+  // Provisioning was entirely unrated. Each call starts a real clone (up to
+  // 250GB) or a real container, so a loop here is a direct attack on the
+  // hypervisor's disk and I/O regardless of the per-account slot cap. Keyed by
+  // user id so it survives IP rotation.
+  const provisionLimit = () => rateLimit("provision", 10, 60 * 60_000, (req) => resolveToken(tokenFromReq(req)) || clientIp(req));
+
+  app.post("/api/vms/provision", provisionLimit(), async (req, res) => {
     const user = userFromReq(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
     const osName = str(req.body?.os, "windows");
@@ -807,8 +828,24 @@ async function startServer() {
     if (!user) return res.status(401).json({ error: "not authenticated" });
     const vm = one<any>("SELECT * FROM vms WHERE id=? AND user_id=?", str(vmId, ""), user.id);
     if (!vm) return res.status(404).json({ error: "not found" });
+    // A clone in flight cannot be stopped safely: `qm shutdown` races the clone,
+    // and walking the row to `stopped` would let it be deleted (qm destroy
+    // --skiplock) while the background clone is still writing, orphaning a real
+    // guest the gateway no longer tracks.
+    if (vm.state === "provisioning") return res.status(409).json({ error: "still provisioning — wait for it to finish before stopping" });
+    if (vm.state === "stopping") return res.status(409).json({ error: "already stopping" });
+    if (vm.state === "stopped" || vm.state === "failed") return res.json({ ok: true });
     q("UPDATE vms SET state='stopping' WHERE id=?", vm.id);
-    await stopVm(vm.vm_id);
+    // pve() resolves {ok:false} rather than rejecting, so an ignored result here
+    // recorded a guest as stopped while it was still running -- unbilled,
+    // uncounted, and still consuming the host. Escalate, then verify.
+    let r = await stopVm(vm.vm_id);
+    if (!r.ok) r = await pve(["qm", "stop", String(vm.vm_id)]);
+    const st = await vmStatus(vm.vm_id);
+    if (st === "running") {
+      console.error(`[vms] ${vm.id} (vmid ${vm.vm_id}) would not stop; leaving in 'stopping' so it stays billed and counted`);
+      return res.status(502).json({ error: "the machine did not stop — it is still running and still billed; try again shortly" });
+    }
     q("UPDATE vms SET state='stopped' WHERE id=?", vm.id);
     res.json({ ok: true });
   });
@@ -931,7 +968,7 @@ async function startServer() {
   });
 
   // ===== UBUNTU GPU SESSIONS (spawn in-browser desktop with the 4080 attached) =====
-  app.post("/api/session/spawn", (req, res) => {
+  app.post("/api/session/spawn", provisionLimit(), (req, res) => {
     const user = userFromReq(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
     // `resolution` is forwarded verbatim in the provision_ubuntu job payload and
@@ -987,6 +1024,12 @@ async function startServer() {
     if (!user) return res.status(401).json({ error: "not authenticated" });
     const sess = one<any>("SELECT * FROM sessions WHERE id=? AND user_id=?", str(req.body?.sessionId, ""), user.id);
     if (!sess) return res.status(404).json({ error: "not found" });
+    // Same reasoning as /api/vms/destroy: a container still being provisioned
+    // must not be walked to a terminal state, or the late provision result
+    // races the destroy and the row ends up describing a container that is
+    // gone (or missing one that is running).
+    if (sess.state === "provisioning") return res.status(409).json({ error: "still provisioning — wait for it to finish before stopping" });
+    if (sess.state === "stopped" || sess.state === "failed") return res.json({ ok: true });
     q("UPDATE sessions SET state='stopping' WHERE id=?", sess.id);
     dispatchJob(sess.node_hostname, "destroy_ubuntu", "", { instanceId: sess.instance_id });
     res.json({ ok: true });
@@ -1134,8 +1177,12 @@ async function startServer() {
   // ===== BILLING ($1/hr, tick every minute, first machine free, auto-stop at 0) =====
   setInterval(() => {
     try {
-      const runningVms = all<any>("SELECT * FROM vms WHERE state='running'");
-      const runningSessions = all<any>("SELECT * FROM sessions WHERE state='running'");
+      // Bill `stopping` too. A guest whose shutdown is slow or stuck is still
+      // consuming the host, so excluding it handed out free compute for as long
+      // as the shutdown hung -- up to the 900s SSH timeout, and indefinitely for
+      // a guest that ignores ACPI.
+      const runningVms = all<any>(`SELECT * FROM vms WHERE state IN ('running','stopping')`);
+      const runningSessions = all<any>(`SELECT * FROM sessions WHERE state IN ('running','stopping')`);
       const perUser = new Map<string, number>();
       for (const r of runningVms) perUser.set(r.user_id, (perUser.get(r.user_id) || 0) + 1);
       for (const s of runningSessions) perUser.set(s.user_id, (perUser.get(s.user_id) || 0) + 1);
@@ -1147,13 +1194,34 @@ async function startServer() {
         q("UPDATE users SET balance_minutes = MAX(0, balance_minutes - ?) WHERE id=?", billable, userId);
         const u = one<any>("SELECT balance_minutes FROM users WHERE id=?", userId);
         if (u && u.balance_minutes <= 0) {
-          for (const r of runningVms.filter((x) => x.user_id === userId)) {
-            q("UPDATE vms SET state='stopping' WHERE id=?", r.id);
-            stopVm(r.vm_id).then(() => q("UPDATE vms SET state='stopped' WHERE id=?", r.id));
-          }
-          for (const s of runningSessions.filter((x) => x.user_id === userId)) {
-            q("UPDATE sessions SET state='stopping' WHERE id=?", s.id);
-            dispatchJob(s.node_hostname, "destroy_ubuntu", "", { instanceId: s.instance_id });
+          // Spare the free allowance. Stopping every machine at zero balance
+          // contradicted the "your first machine is free" promise the 402 on
+          // the provision routes makes -- a customer who ran out of credit lost
+          // the machine they were still entitled to. Oldest machines are the
+          // ones kept, so the free slot is stable rather than arbitrary.
+          const mine = [
+            ...runningVms.filter((x) => x.user_id === userId).map((r) => ({ kind: "vm" as const, row: r })),
+            ...runningSessions.filter((x) => x.user_id === userId).map((s) => ({ kind: "session" as const, row: s })),
+          ].sort((a, b) => Number(a.row.created_at) - Number(b.row.created_at));
+          for (const { kind, row } of mine.slice(FREE_MACHINES)) {
+            if (row.state === "stopping") continue; // already on its way down
+            if (kind === "vm") {
+              q("UPDATE vms SET state='stopping' WHERE id=?", row.id);
+              // Verify it actually stopped. Blindly writing 'stopped' recorded a
+              // live guest as off: uncounted, unbilled, still on the host.
+              void (async () => {
+                let r = await stopVm(row.vm_id);
+                if (!r.ok) r = await pve(["qm", "stop", String(row.vm_id)]);
+                if ((await vmStatus(row.vm_id)) === "running") {
+                  console.error(`[billing] vmid ${row.vm_id} would not stop; leaving 'stopping' so it stays billed`);
+                  return;
+                }
+                q("UPDATE vms SET state='stopped' WHERE id=?", row.id);
+              })();
+            } else {
+              q("UPDATE sessions SET state='stopping' WHERE id=?", row.id);
+              dispatchJob(row.node_hostname, "destroy_ubuntu", "", { instanceId: row.instance_id });
+            }
           }
         }
       }
@@ -1279,11 +1347,22 @@ ${opts.refreshSec ? `<div class="note">Retrying automatically every ${opts.refre
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
+    // express.static would otherwise serve dist/admin.html directly, defeating
+    // the ?token= gate on /admin entirely: the admin SPA was reachable
+    // anonymously at /admin.html, handing out the exact admin API shape.
+    app.use((req, res, next) => {
+      if (/^\/admin\.html\/?$/i.test(req.path)) return res.status(404).send("Not found");
+      next();
+    });
     app.use(express.static(distPath, {
       setHeaders: (res, filePath) => { if (filePath.endsWith("index.html")) res.setHeader("Cache-Control", "no-store"); },
     }));
+    // An unmatched /api/* path fell through to the SPA and returned 200 with
+    // HTML, so a typo'd or removed endpoint was indistinguishable from a real
+    // one. Answer as an API, not as the app.
+    app.use("/api", (_req, res) => res.status(404).json({ error: "not found" }));
     app.get("*", (req, res) => {
-      if (req.path.startsWith("/admin") || req.path.startsWith("/api/admin")) return res.status(404).send("Not found");
+      if (req.path.startsWith("/admin")) return res.status(404).send("Not found");
       res.setHeader("Cache-Control", "no-store");
       res.sendFile(path.join(distPath, "index.html"));
     });
