@@ -4,6 +4,8 @@ import fs from "fs";
 import crypto from "crypto";
 import https from "https";
 import http from "http";
+import net from "net";
+import tls from "tls";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { createServer as createViteServer } from "vite";
@@ -22,8 +24,9 @@ const exec = promisify(execFile);
  * Pricing: $1/hr flat. FIRST machine free per account; the 2nd and 3rd bill.
  *   Sessions are metered exactly like VMs (no more free sessions).
  * Auth: token-based register/login/logout (everyone gets their own account).
- * Proxies: ProxyFly clean residential pool refreshed in the background and
- *   auto-assigned to each Ubuntu session on spawn.
+ * Proxies: operator-run VPN egress boxes (PROXY_ENDPOINTS), health-probed for
+ *   an egress IP that is provably not the operator's own, and auto-assigned to
+ *   each Ubuntu session on spawn. Fails CLOSED (see REQUIRE_CLEAN_PROXY).
  * Payments: BTCPay (real invoices + HMAC-signed webhook settlement).
  * Admin: /admin?token= (404 without token) + /api/admin/* (Bearer).
  */
@@ -246,7 +249,7 @@ db.exec(`
     id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
     instance_id TEXT NOT NULL UNIQUE, node_hostname TEXT NOT NULL,
     node_ip TEXT NOT NULL, port INTEGER NOT NULL, password TEXT NOT NULL,
-    resolution TEXT, proxy TEXT,      -- clean ProxyFly proxy (auto-assigned)
+    resolution TEXT, proxy TEXT,      -- clean egress proxy URL (auto-assigned)
     state TEXT NOT NULL DEFAULT 'provisioning',
     created_at INTEGER NOT NULL
   );
@@ -524,66 +527,268 @@ function userFromReq(req: express.Request): any | null {
   return one<any>("SELECT * FROM users WHERE id=?", userId) || null;
 }
 
-// ---- ProxyFly clean-proxy pool (background refresh + auto-assign) ----
-type PoolProxy = { proxy: string; ip: string; port: number; protocol: string; location: string; anonymity: string; latencyMs: number; clean: boolean; };
-let proxyPool: PoolProxy[] = [];
-let proxyRefreshing = false;
-const PROXY_SOURCE = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/US/data.json";
+// ---- Egress proxy pool (operator-run VPN boxes, health-probed, fail closed) ----
+//
+// This used to scrape a FREE PUBLIC proxy list and hand a random entry to each
+// session. That was wrong three ways: the pool routinely probed down to zero
+// (observed `0 clean / 677 fetched` for four consecutive refreshes, i.e. every
+// session egressed from the operator's own WAN IP), anyone operating a free
+// public proxy can read or tamper with tenant traffic, and an empty pool simply
+// spawned the session unproxied — it failed OPEN. The scraped code path is gone
+// entirely; there is no flag that can repopulate the pool from the internet.
+//
+// The pool is now exactly what PROXY_ENDPOINTS names: LAN boxes the operator
+// runs, each with a VPN client plus a proxy listener, so traffic through the
+// proxy egresses via the VPN.
+//
+// THE HEALTH CHECK IS NOT A REACHABILITY CHECK. Observed in production: when a
+// box's VPN dropped, its proxy kept accepting connections and happily served
+// traffic from the operator's home IP. "Does it respond?" is worthless. An
+// endpoint counts as healthy only when a probe fetched an egress-IP echo
+// THROUGH it, got back a syntactically valid IP, and that IP is not in
+// PROXY_FORBIDDEN_EGRESS. If PROXY_FORBIDDEN_EGRESS is empty the check cannot
+// run at all, so nothing is ever healthy — fail closed, not "assume fine".
+type ProxyEndpoint = {
+  url: string;            // verbatim what the node agent is handed and dials
+  protocol: string;       // http | https | socks5 | socks5h
+  host: string;
+  port: number;
+  healthy: boolean;       // reachable AND provably not leaking
+  reachable: boolean;     // the probe completed, whatever it observed
+  egressIp: string | null;
+  latencyMs: number;
+  lastChecked: number;    // epoch ms, 0 = never probed
+  lastError: string | null;
+};
 
-function fetchProxies(): Promise<PoolProxy[]> {
-  return new Promise((resolve) => {
-    const req = https.get(PROXY_SOURCE, { headers: { "User-Agent": "VortexGPU/1.0" } }, (res) => {
-      let buf = ""; res.on("data", (c) => (buf += c));
-      res.on("end", () => {
-        try {
-          const arr: any[] = JSON.parse(buf);
-          resolve(arr.filter((p) => p?.ip && p?.port).map((p) => ({
-            proxy: p.proxy || `${p.protocol}://${p.ip}:${p.port}`, ip: String(p.ip), port: Number(p.port),
-            protocol: String(p.protocol || "http"), location: p.geolocation?.country || "?", anonymity: String(p.anonymity || "transparent"),
-            latencyMs: 0, clean: false,
-          })));
-        } catch { resolve([]); }
-      });
+const DEFAULT_PROXY_PORTS: Record<string, number> = { http: 3128, https: 3128, socks5: 1080, socks5h: 1080 };
+
+function parseProxyEndpoints(raw: string): ProxyEndpoint[] {
+  const out: ProxyEndpoint[] = [];
+  const seen = new Set<string>();
+  for (const item of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+    let u: URL;
+    try { u = new URL(item); } catch { console.error(`[proxy] ignoring unparseable PROXY_ENDPOINTS entry: ${item}`); continue; }
+    const protocol = u.protocol.replace(/:$/, "").toLowerCase();
+    if (!(protocol in DEFAULT_PROXY_PORTS)) { console.error(`[proxy] ignoring endpoint with unsupported scheme: ${item}`); continue; }
+    const port = Number(u.port) || DEFAULT_PROXY_PORTS[protocol];
+    if (!u.hostname) { console.error(`[proxy] ignoring endpoint with no host: ${item}`); continue; }
+    const url = `${protocol}://${u.hostname}:${port}`;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push({ url, protocol, host: u.hostname, port, healthy: false, reachable: false, egressIp: null, latencyMs: 0, lastChecked: 0, lastError: null });
+  }
+  return out;
+}
+
+const proxyEndpoints: ProxyEndpoint[] = parseProxyEndpoints(str(process.env.PROXY_ENDPOINTS, ""));
+// IPs that must NEVER be a session's egress — the operator's own WAN address.
+const PROXY_FORBIDDEN_EGRESS = new Set(
+  str(process.env.PROXY_FORBIDDEN_EGRESS, "").split(",").map((s) => s.trim()).filter(Boolean));
+// Default 1: refuse to spawn a session that would have no clean egress.
+const REQUIRE_CLEAN_PROXY = str(process.env.REQUIRE_CLEAN_PROXY, "1").trim() !== "0";
+const PROXY_CHECK_URL = str(process.env.PROXY_CHECK_URL, "https://api.ipify.org");
+// Short by design: a box whose VPN wedged must not stall the refresh loop.
+const PROXY_CHECK_TIMEOUT_MS = Math.max(1000, num(process.env.PROXY_CHECK_TIMEOUT_MS, 6000));
+const PROXY_REFRESH_MS = Math.max(15_000, num(process.env.PROXY_REFRESH_MS, 5 * 60_000));
+
+let proxyRefreshing = false;
+let proxyCursor = 0;
+
+function isIpLiteral(v: string): boolean {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(v) ? v.split(".").every((o) => Number(o) <= 255) : /^[0-9a-f:]+$/i.test(v) && v.includes(":");
+}
+
+/** SOCKS5 CONNECT (no auth). Resolves with a socket tunnelled to host:port. */
+function socks5Tunnel(ep: ProxyEndpoint, host: string, port: number, timeoutMs: number): Promise<net.Socket> {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ host: ep.host, port: ep.port });
+    let settled = false;
+    const fail = (msg: string) => { if (settled) return; settled = true; sock.destroy(); reject(new Error(msg)); };
+    sock.setTimeout(timeoutMs, () => fail("socks5 timeout"));
+    sock.on("error", (e) => fail(`socks5 ${(e as NodeJS.ErrnoException).code || e.message}`));
+    let stage: "greet" | "connect" = "greet";
+    let buf = Buffer.alloc(0);
+    sock.on("data", (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (stage === "greet") {
+        if (buf.length < 2) return;
+        if (buf[0] !== 0x05 || buf[1] !== 0x00) return fail("socks5 refused (auth required or bad version)");
+        buf = buf.subarray(2);
+        stage = "connect";
+        const hostBuf = Buffer.from(host, "utf8");
+        const req = Buffer.concat([
+          Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]), hostBuf,
+          Buffer.from([(port >> 8) & 0xff, port & 0xff]),
+        ]);
+        sock.write(req);
+        if (buf.length === 0) return;
+      }
+      // Reply: VER REP RSV ATYP ADDR PORT — length depends on ATYP.
+      if (buf.length < 5) return;
+      if (buf[1] !== 0x00) return fail(`socks5 connect rejected (rep=${buf[1]})`);
+      const atyp = buf[3];
+      const need = atyp === 0x01 ? 10 : atyp === 0x04 ? 22 : atyp === 0x03 ? 7 + buf[4] : -1;
+      if (need < 0) return fail("socks5 bad ATYP");
+      if (buf.length < need) return;
+      if (settled) return;
+      settled = true;
+      sock.setTimeout(0);
+      sock.removeAllListeners("data");
+      sock.removeAllListeners("error");
+      const extra = buf.subarray(need);
+      if (extra.length) sock.unshift(extra);
+      resolve(sock);
     });
-    req.setTimeout(20000, () => { req.destroy(); resolve([]); });
-    req.on("error", () => resolve([]));
+    sock.on("connect", () => sock.write(Buffer.from([0x05, 0x01, 0x00])));
   });
 }
 
-function testProxy(p: PoolProxy): Promise<PoolProxy | null> {
-  return new Promise((resolve) => {
-    if (p.protocol !== "http" && p.protocol !== "https") return resolve(null);
-    const t0 = Date.now();
-    const mod = p.protocol === "https" ? https : http;
-    const req = mod.request({ host: p.ip, port: p.port, method: "GET", path: "http://api.ipify.org", headers: { Host: "api.ipify.org" }, timeout: 8000 }, (res) => {
-      let b = ""; res.on("data", (c) => (b += c));
-      res.on("end", () => {
-        const egressIp = b.trim();
-        const clean = res.statusCode === 200 && /^\d{1,3}(\.\d{1,3}){3}$/.test(egressIp) && p.anonymity !== "transparent";
-        resolve(clean ? { ...p, latencyMs: Date.now() - t0, clean: true } : null);
-      });
+/** HTTP CONNECT tunnel through an http(s) proxy. */
+function httpConnectTunnel(ep: ProxyEndpoint, host: string, port: number, timeoutMs: number): Promise<net.Socket> {
+  return new Promise((resolve, reject) => {
+    const mod = ep.protocol === "https" ? https : http;
+    const req = mod.request({
+      host: ep.host, port: ep.port, method: "CONNECT", path: `${host}:${port}`,
+      headers: { Host: `${host}:${port}` }, timeout: timeoutMs,
+      ...(ep.protocol === "https" ? { rejectUnauthorized: false } : {}),
+    } as any);
+    let settled = false;
+    const fail = (msg: string) => { if (settled) return; settled = true; req.destroy(); reject(new Error(msg)); };
+    req.on("connect", (res, socket) => {
+      if (res.statusCode !== 200) { socket.destroy(); return fail(`CONNECT returned ${res.statusCode}`); }
+      settled = true;
+      resolve(socket);
     });
-    req.on("error", () => resolve(null));
-    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.on("timeout", () => fail("CONNECT timeout"));
+    req.on("error", (e) => fail(`CONNECT ${(e as NodeJS.ErrnoException).code || e.message}`));
     req.end();
   });
+}
+
+/**
+ * GET `target` THROUGH `ep` and return the response body.
+ *
+ * An http(s) proxy fetching an http:// URL uses absolute-form (what Squid and
+ * friends expect on 3128); everything else is tunnelled first — CONNECT for an
+ * http(s) proxy, a SOCKS5 handshake for socks5 — and the request is then issued
+ * over that socket, wrapped in TLS when the target is https://.
+ */
+function fetchThroughProxy(ep: ProxyEndpoint, target: URL, timeoutMs: number): Promise<string> {
+  const targetPort = Number(target.port) || (target.protocol === "https:" ? 443 : 80);
+  const headers = { Host: target.host, "User-Agent": "VortexGPU/1.0", Connection: "close" };
+
+  const collect = (req: http.ClientRequest, reject: (e: Error) => void, resolve: (s: string) => void) => {
+    req.on("response", (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => { if (body.length < 4096) body += c; });
+      res.on("end", () => (res.statusCode === 200 ? resolve(body) : reject(new Error(`probe HTTP ${res.statusCode}`))));
+    });
+    req.on("timeout", () => { req.destroy(new Error("probe timeout")); });
+    req.on("error", (e) => reject(new Error((e as NodeJS.ErrnoException).code || e.message)));
+    req.end();
+  };
+
+  if ((ep.protocol === "http" || ep.protocol === "https") && target.protocol === "http:") {
+    return new Promise((resolve, reject) => {
+      const mod = ep.protocol === "https" ? https : http;
+      collect(mod.request({
+        host: ep.host, port: ep.port, method: "GET", path: target.href, headers, timeout: timeoutMs,
+        ...(ep.protocol === "https" ? { rejectUnauthorized: false } : {}),
+      } as any), reject, resolve);
+    });
+  }
+
+  const tunnel = ep.protocol === "socks5" || ep.protocol === "socks5h"
+    ? socks5Tunnel(ep, target.hostname, targetPort, timeoutMs)
+    : httpConnectTunnel(ep, target.hostname, targetPort, timeoutMs);
+
+  return tunnel.then((socket) => new Promise<string>((resolve, reject) => {
+    const path = `${target.pathname}${target.search}` || "/";
+    const opts: any = {
+      createConnection: () => (target.protocol === "https:"
+        ? tls.connect({ socket, servername: target.hostname })
+        : socket),
+      host: target.hostname, port: targetPort, method: "GET", path, headers, timeout: timeoutMs,
+    };
+    const req = (target.protocol === "https:" ? https : http).request(opts);
+    const done = (fn: (v: any) => void) => (v: any) => { try { socket.destroy(); } catch { /* already gone */ } fn(v); };
+    collect(req, done(reject), done(resolve));
+  }));
+}
+
+/**
+ * Probe one endpoint and update its health in place. Healthy requires a real
+ * answer AND a valid egress IP AND that IP not being a forbidden (leaking) one.
+ */
+async function probeProxyEndpoint(ep: ProxyEndpoint): Promise<void> {
+  const wasHealthy = ep.healthy;
+  const t0 = Date.now();
+  let target: URL;
+  try { target = new URL(PROXY_CHECK_URL); } catch {
+    ep.healthy = false; ep.reachable = false; ep.lastError = "PROXY_CHECK_URL is not a URL"; ep.lastChecked = Date.now();
+    return;
+  }
+  try {
+    const body = await fetchThroughProxy(ep, target, PROXY_CHECK_TIMEOUT_MS);
+    const egress = body.trim().split(/\s/)[0] || "";
+    ep.latencyMs = Date.now() - t0;
+    ep.lastChecked = Date.now();
+    ep.reachable = true;
+    if (!isIpLiteral(egress)) {
+      ep.healthy = false; ep.egressIp = null;
+      ep.lastError = `probe did not return an IP (${JSON.stringify(body.slice(0, 60))})`;
+    } else {
+      ep.egressIp = egress;
+      if (PROXY_FORBIDDEN_EGRESS.size === 0) {
+        // No forbidden list means the anonymity check cannot run. Refusing to
+        // call anything healthy is the fail-closed answer; the alternative is
+        // silently shipping tenants out of the operator's home IP again.
+        ep.healthy = false;
+        ep.lastError = "PROXY_FORBIDDEN_EGRESS is unset — cannot verify the exit is not the operator's own IP";
+      } else if (PROXY_FORBIDDEN_EGRESS.has(egress)) {
+        ep.healthy = false;
+        ep.lastError = `LEAKING: egress ${egress} is a forbidden address`;
+        console.error(`[proxy] LEAK ${ep.url}: egress is ${egress}, a forbidden address — the VPN on that box is DOWN and the proxy is serving the operator's own IP. Endpoint removed from the pool.`);
+      } else {
+        ep.healthy = true;
+        ep.lastError = null;
+      }
+    }
+  } catch (e) {
+    ep.reachable = false;
+    ep.healthy = false;
+    ep.egressIp = null;
+    ep.latencyMs = Date.now() - t0;
+    ep.lastChecked = Date.now();
+    ep.lastError = String((e as Error)?.message || e).slice(0, 200);
+  }
+  if (wasHealthy && !ep.healthy) console.error(`[proxy] ${ep.url} is no longer a clean exit: ${ep.lastError}`);
 }
 
 async function refreshProxyPool() {
   if (proxyRefreshing) return;
   proxyRefreshing = true;
   try {
-    const list = await fetchProxies();
-    const candidates = list.filter((p) => p.anonymity === "elite" || p.anonymity === "anonymous").slice(0, 100);
-    const results = await Promise.all(candidates.map(testProxy));
-    proxyPool = results.filter((p): p is PoolProxy => !!p);
-    console.log(`[proxy] pool refreshed: ${proxyPool.length} clean / ${list.length} fetched`);
+    await Promise.all(proxyEndpoints.map((ep) => probeProxyEndpoint(ep)));
+    const healthy = proxyEndpoints.filter((e) => e.healthy).length;
+    const msg = `[proxy] health: ${healthy} clean / ${proxyEndpoints.length} configured`;
+    if (healthy === 0 && proxyEndpoints.length > 0) console.error(`${msg} — NO clean exit available`);
+    else console.log(msg);
   } catch (e) { console.error("[proxy]", e); }
   finally { proxyRefreshing = false; }
 }
-function assignProxy(): PoolProxy | null {
-  if (!proxyPool.length) return null;
-  return proxyPool[Math.floor(Math.random() * proxyPool.length)];
+
+function healthyProxies(): ProxyEndpoint[] { return proxyEndpoints.filter((e) => e.healthy); }
+
+/** Round-robin over the HEALTHY endpoints only. Null when there is no clean exit. */
+function assignProxy(): ProxyEndpoint | null {
+  const healthy = healthyProxies();
+  if (!healthy.length) return null;
+  const pick = healthy[proxyCursor % healthy.length];
+  proxyCursor = (proxyCursor + 1) % healthy.length;
+  return pick;
 }
 
 // Count a user's active machines (VMs + sessions) for the free-slot / cap.
@@ -761,6 +966,11 @@ async function startServer() {
       gpuVramFreeMb: sessionNode ? Math.max(0, (sessionNode.memTotalMb || 0) - (sessionNode.memUsedMb || 0)) : 0,
       gpuVramTotalMb: sessionNode ? (sessionNode.memTotalMb || 0) : 0,
       minFreeVramMb: MIN_FREE_VRAM_MB,
+      // Counts only — never an endpoint URL and never an egress IP. This route is
+      // public, and the set of addresses a tenant can egress from is exactly the
+      // thing an anonymity product must not publish.
+      cleanExitsAvailable: healthyProxies().length,
+      requireCleanProxy: REQUIRE_CLEAN_PROXY,
       gpuSku: GPU_SKU, priceUsdPerHour: PRICE_USD_PER_HOUR, maxVmsPerUser: MAX_VMS_PER_USER,
       freeMachines: FREE_MACHINES,
       timestamp: new Date().toISOString(),
@@ -775,10 +985,21 @@ async function startServer() {
   // and a tenant's own assigned proxy is already on their session row.
   // RESPONSE SHAPE CHANGE: `proxies[].ip` is gone, and the route now 401s when
   // unauthenticated. Nothing in src/ consumes this route; the admin surface
-  // reads the pool from /api/admin/state, which is unchanged.
+  // reads the pool from /api/admin/state.
+  //
+  // The pool is now the operator's own boxes, which makes leaking it WORSE, not
+  // better: `ip` would be an egress the operator controls, and the endpoint URL
+  // is a LAN address. Neither appears here — a tenant gets the healthy count and
+  // per-entry latency only, and their own assigned proxy is on their session row.
   app.get("/api/proxy/pool", (req, res) => {
     if (!userFromReq(req)) return res.status(401).json({ error: "not authenticated" });
-    res.json({ count: proxyPool.length, proxies: proxyPool.slice(0, 20).map((p) => ({ location: p.location, latencyMs: p.latencyMs, anonymity: p.anonymity })) });
+    const healthy = healthyProxies();
+    res.json({
+      count: healthy.length,
+      configured: proxyEndpoints.length,
+      requireCleanProxy: REQUIRE_CLEAN_PROXY,
+      proxies: healthy.slice(0, 20).map((p) => ({ latencyMs: p.latencyMs, lastChecked: p.lastChecked })),
+    });
   });
 
   // ===== AUTH (register / login / logout) =====
@@ -1132,16 +1353,28 @@ async function startServer() {
     const instanceId = "sess_" + crypto.randomBytes(16).toString("hex");
     const port = allocateSessionPort();
     if (port === null) return res.status(503).json({ error: "no free ports — try again shortly" });
+
+    // Clean-egress preflight. This product is sold on anonymity, so a session
+    // with no verified-clean proxy would egress from the operator's own WAN IP
+    // and deanonymise the tenant. It used to fail OPEN: assignProxy() returned
+    // null on an empty pool and the spawn carried on regardless. It now fails
+    // CLOSED, exactly like the MIN_FREE_VRAM_MB preflight above — 503, no
+    // session row, no dispatched job, nothing charged. Set REQUIRE_CLEAN_PROXY=0
+    // to deliberately allow un-proxied sessions.
+    const proxy = assignProxy(); // round-robin over provably-clean exits only
+    if (!proxy && REQUIRE_CLEAN_PROXY) {
+      return res.status(503).json({ error: `no clean egress available — 0 of ${proxyEndpoints.length} configured proxies are verified clean, and this platform will not start an unproxied session. Nothing was charged; try again shortly.` });
+    }
+
     const password = "Ub" + crypto.randomBytes(6).toString("hex") + "!";
     const id = "ses_" + crypto.randomBytes(8).toString("hex");
-    const proxy = assignProxy(); // clean ProxyFly proxy, auto-assigned in background
 
     q("INSERT INTO sessions (id,user_id,instance_id,node_hostname,node_ip,port,password,resolution,proxy,state,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-      id, user.id, instanceId, hostname, node.ip, port, password, reso, proxy?.proxy ?? null, "provisioning", Date.now());
-    dispatchJob(hostname, "provision_ubuntu", "", { instanceId, port, password, resolution: reso, proxy: proxy?.proxy ?? null });
+      id, user.id, instanceId, hostname, node.ip, port, password, reso, proxy?.url ?? null, "provisioning", Date.now());
+    dispatchJob(hostname, "provision_ubuntu", "", { instanceId, port, password, resolution: reso, proxy: proxy?.url ?? null });
 
     recordFreeMachine(req, user);
-    res.json({ id, instanceId, port, password, resolution: reso, proxy: proxy?.proxy ?? null, state: "provisioning", url: `/session/${instanceId}/`, desktopUrl: desktopUrlFor(instanceId, password) });
+    res.json({ id, instanceId, port, password, resolution: reso, proxy: proxy?.url ?? null, state: "provisioning", url: `/session/${instanceId}/`, desktopUrl: desktopUrlFor(instanceId, password) });
   });
 
   app.get("/api/sessions", (req, res) => {
@@ -1264,7 +1497,23 @@ async function startServer() {
       // hold ADMIN_TOKEN to reach this route, so echoing it back bought nothing and
       // pushed the long-lived admin secret into browser memory, history, logs and
       // any error/telemetry sink that captures API responses.
-      proxyPool: proxyPool.slice(0, 20).map((p) => ({ ip: p.ip, location: p.location, latencyMs: p.latencyMs })),
+      // Admin-gated, so this is the one place the endpoint URLs and observed
+      // egress IPs are allowed to appear — that is precisely the operator's
+      // signal that a box's VPN has dropped. `ip`/`location` stay populated so
+      // the existing admin panel keeps rendering; `ip` falls back to the URL when
+      // no egress was observed, so rows stay distinct.
+      proxyPool: proxyEndpoints.slice(0, 20).map((p) => ({
+        url: p.url,
+        healthy: p.healthy,
+        reachable: p.reachable,
+        egressIp: p.egressIp,
+        lastChecked: p.lastChecked,
+        lastError: p.lastError,
+        ip: p.egressIp ?? p.url,
+        location: p.healthy ? "clean" : p.egressIp ? "LEAKING" : "down",
+        latencyMs: p.latencyMs,
+      })),
+      requireCleanProxy: REQUIRE_CLEAN_PROXY,
     });
   });
 
@@ -1522,9 +1771,17 @@ ${opts.refreshSec ? `<div class="note">Retrying automatically every ${opts.refre
     });
   }
 
-  // Kick the ProxyFly pool refresher (background auto-assign of clean proxies).
+  // Kick the egress-proxy health prober. Same cadence idiom as the reconciler:
+  // one pass now, then every PROXY_REFRESH_MS. Until the first pass completes
+  // nothing is healthy, so a spawn in that window is refused rather than
+  // silently un-proxied.
+  if (proxyEndpoints.length === 0) {
+    console.error(`[proxy] no PROXY_ENDPOINTS configured — sessions have no clean egress. REQUIRE_CLEAN_PROXY=${REQUIRE_CLEAN_PROXY ? "1 (spawns will be refused)" : "0 (spawns will proceed UNPROXIED)"}`);
+  } else if (PROXY_FORBIDDEN_EGRESS.size === 0) {
+    console.error("[proxy] PROXY_FORBIDDEN_EGRESS is unset — the anonymity check cannot run, so no endpoint can be marked healthy. Set it to the operator's WAN IP(s).");
+  }
   refreshProxyPool();
-  setInterval(refreshProxyPool, 5 * 60_000);
+  setInterval(refreshProxyPool, PROXY_REFRESH_MS);
 
   // Keep vm rows honest against the host. A reconcile failure must never take
   // the gateway down, so errors are logged and swallowed.
