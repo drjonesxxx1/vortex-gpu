@@ -27,6 +27,8 @@ const exec = promisify(execFile);
  * Proxies: operator-run VPN egress boxes (PROXY_ENDPOINTS), health-probed for
  *   an egress IP that is provably not the operator's own, and auto-assigned to
  *   each Ubuntu session on spawn. Fails CLOSED (see REQUIRE_CLEAN_PROXY).
+ *   An opt-in tier 2 of untrusted public proxies (PROXY_FALLBACK_ENABLED) is
+ *   used only when tier 1 has no clean exit, under the identical check.
  * Payments: BTCPay (real invoices + HMAC-signed webhook settlement).
  * Admin: /admin?token= (404 without token) + /api/admin/* (Bearer).
  */
@@ -537,9 +539,27 @@ function userFromReq(req: express.Request): any | null {
 // spawned the session unproxied — it failed OPEN. The scraped code path is gone
 // entirely; there is no flag that can repopulate the pool from the internet.
 //
-// The pool is now exactly what PROXY_ENDPOINTS names: LAN boxes the operator
-// runs, each with a VPN client plus a proxy listener, so traffic through the
-// proxy egresses via the VPN.
+// TIER 1 is exactly what PROXY_ENDPOINTS names: LAN boxes the operator runs,
+// each with a VPN client plus a proxy listener, so traffic through the proxy
+// egresses via the VPN. These are the trusted exits and are always preferred.
+//
+// TIER 2 is an OPT-IN (PROXY_FALLBACK_ENABLED=1, default off) pool sourced from
+// the Proxifly free public list, for the case observed in production where all
+// three operator boxes dropped their tunnels at once and every spawn was
+// refused. It is a LAST RESORT and is honestly labelled as such: whoever runs a
+// free public proxy can READ AND MODIFY every unencrypted byte a tenant sends
+// through it, can see the destination of every TLS connection, and may be
+// running it precisely to harvest that. Tier 2 is never handed out while a
+// single Tier 1 exit is clean, it is surfaced per-endpoint in the admin state so
+// the operator can see they are on untrusted exits, and a switch between tiers
+// is logged. It buys availability by spending confidentiality — that trade is
+// the operator's to make deliberately, which is why the default is 0.
+//
+// What tiering does NOT change is the safety bar. A Tier 2 endpoint is healthy
+// under exactly the same rule as a Tier 1 one: a probe through it returned a
+// syntactically valid IP that is not in PROXY_FORBIDDEN_EGRESS. There is no
+// weaker path. If NOTHING in either tier verifies clean, the spawn is still
+// refused — the fallback adds a tier, it does not add a way to fail open.
 //
 // THE HEALTH CHECK IS NOT A REACHABILITY CHECK. Observed in production: when a
 // box's VPN dropped, its proxy kept accepting connections and happily served
@@ -553,6 +573,7 @@ type ProxyEndpoint = {
   protocol: string;       // http | https | socks5 | socks5h
   host: string;
   port: number;
+  tier: 1 | 2;            // 1 = operator-run VPN box, 2 = untrusted public fallback
   healthy: boolean;       // reachable AND provably not leaking
   reachable: boolean;     // the probe completed, whatever it observed
   egressIp: string | null;
@@ -563,25 +584,32 @@ type ProxyEndpoint = {
 
 const DEFAULT_PROXY_PORTS: Record<string, number> = { http: 3128, https: 3128, socks5: 1080, socks5h: 1080 };
 
-function parseProxyEndpoints(raw: string): ProxyEndpoint[] {
+/**
+ * Turn a list of proxy URLs into endpoints. `quiet` suppresses the per-entry
+ * rejection logs: a hand-written PROXY_ENDPOINTS typo is worth shouting about,
+ * but a scraped list of hundreds routinely contains schemes we do not speak and
+ * would otherwise flood the log every refresh.
+ */
+function parseProxyEndpoints(items: string[], tier: 1 | 2, quiet = false): ProxyEndpoint[] {
   const out: ProxyEndpoint[] = [];
   const seen = new Set<string>();
-  for (const item of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+  const drop = (msg: string) => { if (!quiet) console.error(msg); };
+  for (const item of items.map((s) => s.trim()).filter(Boolean)) {
     let u: URL;
-    try { u = new URL(item); } catch { console.error(`[proxy] ignoring unparseable PROXY_ENDPOINTS entry: ${item}`); continue; }
+    try { u = new URL(item); } catch { drop(`[proxy] ignoring unparseable endpoint: ${item}`); continue; }
     const protocol = u.protocol.replace(/:$/, "").toLowerCase();
-    if (!(protocol in DEFAULT_PROXY_PORTS)) { console.error(`[proxy] ignoring endpoint with unsupported scheme: ${item}`); continue; }
+    if (!(protocol in DEFAULT_PROXY_PORTS)) { drop(`[proxy] ignoring endpoint with unsupported scheme: ${item}`); continue; }
     const port = Number(u.port) || DEFAULT_PROXY_PORTS[protocol];
-    if (!u.hostname) { console.error(`[proxy] ignoring endpoint with no host: ${item}`); continue; }
+    if (!u.hostname) { drop(`[proxy] ignoring endpoint with no host: ${item}`); continue; }
     const url = `${protocol}://${u.hostname}:${port}`;
     if (seen.has(url)) continue;
     seen.add(url);
-    out.push({ url, protocol, host: u.hostname, port, healthy: false, reachable: false, egressIp: null, latencyMs: 0, lastChecked: 0, lastError: null });
+    out.push({ url, protocol, host: u.hostname, port, tier, healthy: false, reachable: false, egressIp: null, latencyMs: 0, lastChecked: 0, lastError: null });
   }
   return out;
 }
 
-const proxyEndpoints: ProxyEndpoint[] = parseProxyEndpoints(str(process.env.PROXY_ENDPOINTS, ""));
+const proxyEndpoints: ProxyEndpoint[] = parseProxyEndpoints(str(process.env.PROXY_ENDPOINTS, "").split(","), 1);
 // IPs that must NEVER be a session's egress — the operator's own WAN address.
 const PROXY_FORBIDDEN_EGRESS = new Set(
   str(process.env.PROXY_FORBIDDEN_EGRESS, "").split(",").map((s) => s.trim()).filter(Boolean));
@@ -592,8 +620,37 @@ const PROXY_CHECK_URL = str(process.env.PROXY_CHECK_URL, "https://api.ipify.org"
 const PROXY_CHECK_TIMEOUT_MS = Math.max(1000, num(process.env.PROXY_CHECK_TIMEOUT_MS, 6000));
 const PROXY_REFRESH_MS = Math.max(15_000, num(process.env.PROXY_REFRESH_MS, 5 * 60_000));
 
+// ---- Tier 2: opt-in Proxifly fallback ----
+// Default OFF. Turning it on means accepting that some sessions will egress via
+// a stranger's proxy that can read their unencrypted traffic (see the block
+// comment above). It exists so a simultaneous outage of the operator's boxes
+// degrades service instead of stopping it.
+const PROXY_FALLBACK_ENABLED = str(process.env.PROXY_FALLBACK_ENABLED, "0").trim() === "1";
+const PROXY_FALLBACK_SOURCE = str(process.env.PROXY_FALLBACK_SOURCE,
+  "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/US/data.json");
+// How many candidates we probe per refresh. The upstream list has run to 677
+// entries; probing all of them at the check timeout would make the refresh far
+// outlive its own interval, so it is capped and the cap is configurable.
+const PROXY_FALLBACK_MAX = Math.max(0, num(process.env.PROXY_FALLBACK_MAX, 25));
+// Probes run this many at a time, so a capped-but-large list still finishes in
+// roughly (max/concurrency) * timeout rather than serialising.
+const PROXY_PROBE_CONCURRENCY = 8;
+// A hostile or broken source must not be able to exhaust memory: stop reading
+// past this and treat the fetch as failed.
+const PROXY_FALLBACK_MAX_BYTES = 4 * 1024 * 1024;
+
+// Replaced wholesale ONLY on a successful refresh. A fetch failure leaves the
+// previous (already-probed) pool in place rather than emptying it — an outage at
+// jsdelivr is not evidence that these exits went bad.
+let fallbackEndpoints: ProxyEndpoint[] = [];
+let fallbackLastRefresh = 0;
+let fallbackLastError: string | null = null;
+
 let proxyRefreshing = false;
 let proxyCursor = 0;
+let fallbackCursor = 0;
+// Which tier assignProxy() last served, so a switch can be logged exactly once.
+let servingTier: 0 | 1 | 2 = 0;
 
 function isIpLiteral(v: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(v) ? v.split(".").every((o) => Number(o) <= 255) : /^[0-9a-f:]+$/i.test(v) && v.includes(":");
@@ -750,7 +807,9 @@ async function probeProxyEndpoint(ep: ProxyEndpoint): Promise<void> {
       } else if (PROXY_FORBIDDEN_EGRESS.has(egress)) {
         ep.healthy = false;
         ep.lastError = `LEAKING: egress ${egress} is a forbidden address`;
-        console.error(`[proxy] LEAK ${ep.url}: egress is ${egress}, a forbidden address — the VPN on that box is DOWN and the proxy is serving the operator's own IP. Endpoint removed from the pool.`);
+        console.error(ep.tier === 1
+          ? `[proxy] LEAK ${ep.url}: egress is ${egress}, a forbidden address — the VPN on that box is DOWN and the proxy is serving the operator's own IP. Endpoint removed from the pool.`
+          : `[proxy] LEAK ${ep.url} (fallback tier): egress is ${egress}, a forbidden address. Endpoint removed from the pool.`);
       } else {
         ep.healthy = true;
         ep.lastError = null;
@@ -767,28 +826,161 @@ async function probeProxyEndpoint(ep: ProxyEndpoint): Promise<void> {
   if (wasHealthy && !ep.healthy) console.error(`[proxy] ${ep.url} is no longer a clean exit: ${ep.lastError}`);
 }
 
+/** Probe `eps` at most `limit` at a time, so a long list cannot stall the loop. */
+async function probeAll(eps: ProxyEndpoint[], limit: number): Promise<void> {
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= eps.length) return;
+      await probeProxyEndpoint(eps[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), eps.length || 1) }, worker));
+}
+
+/** GET the fallback list itself — DIRECTLY, not through any proxy. */
+function fetchFallbackSource(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let target: URL;
+    try { target = new URL(PROXY_FALLBACK_SOURCE); } catch { return reject(new Error("PROXY_FALLBACK_SOURCE is not a URL")); }
+    if (target.protocol !== "http:" && target.protocol !== "https:") return reject(new Error(`unsupported source scheme ${target.protocol}`));
+    let settled = false;
+    const fail = (msg: string) => { if (settled) return; settled = true; try { req.destroy(); } catch { /* already gone */ } reject(new Error(msg)); };
+    const req = (target.protocol === "https:" ? https : http).get(target, {
+      headers: { "User-Agent": "VortexGPU/1.0", Connection: "close" }, timeout: PROXY_CHECK_TIMEOUT_MS,
+    }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return fail(`source returned HTTP ${res.statusCode}`); }
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => {
+        if (settled) return;
+        body += c;
+        if (body.length > PROXY_FALLBACK_MAX_BYTES) fail(`source exceeded ${PROXY_FALLBACK_MAX_BYTES} bytes`);
+      });
+      res.on("end", () => { if (settled) return; settled = true; resolve(body); });
+      res.on("error", (e) => fail(String((e as Error).message)));
+    });
+    req.on("timeout", () => fail("source fetch timeout"));
+    req.on("error", (e) => fail(String((e as NodeJS.ErrnoException).code || (e as Error).message)));
+  });
+}
+
+/**
+ * Parse the Proxifly payload (a JSON array of {proxy|ip+port} objects) or a
+ * plain newline list of `host:port` / `proto://host:port`. Throws when nothing
+ * usable comes out, which the caller treats as a failed refresh — i.e. a 404
+ * page or a truncated file leaves the previous pool alone instead of wiping it.
+ */
+function parseFallbackSource(body: string): ProxyEndpoint[] {
+  const items: string[] = [];
+  const trimmed = body.trim();
+  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+    let data: any;
+    try { data = JSON.parse(trimmed); } catch { throw new Error("source did not parse as JSON"); }
+    const arr: any[] | null = Array.isArray(data) ? data : Array.isArray(data?.proxies) ? data.proxies : null;
+    if (!arr) throw new Error("source JSON was not a list of proxies");
+    for (const p of arr) {
+      if (typeof p === "string") items.push(p);
+      else if (p?.proxy) items.push(String(p.proxy));
+      else if (p?.ip && p?.port) items.push(`${String(p.protocol || "http")}://${p.ip}:${p.port}`);
+    }
+  } else {
+    for (const line of trimmed.split(/[\r\n]+/)) {
+      const s = line.trim();
+      if (!s || s.startsWith("#")) continue;
+      items.push(s.includes("://") ? s : `http://${s}`);
+    }
+  }
+  const tier1 = new Set(proxyEndpoints.map((e) => e.url));
+  const parsed = parseFallbackEndpointList(items).filter((e) => !tier1.has(e.url));
+  if (!parsed.length) throw new Error("source contained no usable proxy entries");
+  return parsed.slice(0, PROXY_FALLBACK_MAX);
+}
+
+function parseFallbackEndpointList(items: string[]): ProxyEndpoint[] {
+  return parseProxyEndpoints(items, 2, true);
+}
+
+/**
+ * Refresh Tier 2. Never throws: a failure is logged and the previous pool is
+ * kept, because "the CDN 404'd" says nothing about the exits we already probed.
+ */
+async function refreshFallbackPool(): Promise<void> {
+  if (!PROXY_FALLBACK_ENABLED) return;
+  try {
+    const candidates = parseFallbackSource(await fetchFallbackSource());
+    // Probed BEFORE being published, and to the same bar as the operator's own
+    // boxes: assignProxy() only ever sees entries that answered with an IP that
+    // is not forbidden.
+    await probeAll(candidates, PROXY_PROBE_CONCURRENCY);
+    fallbackEndpoints = candidates;
+    fallbackLastRefresh = Date.now();
+    fallbackLastError = null;
+    const clean = candidates.filter((e) => e.healthy).length;
+    console.log(`[proxy] fallback tier (UNTRUSTED public proxies): ${clean} clean / ${candidates.length} probed, cap ${PROXY_FALLBACK_MAX}`);
+  } catch (e) {
+    fallbackLastError = String((e as Error)?.message || e).slice(0, 200);
+    const kept = fallbackEndpoints.filter((e) => e.healthy).length;
+    console.error(`[proxy] fallback refresh failed: ${fallbackLastError} — keeping the previous fallback pool (${kept} clean / ${fallbackEndpoints.length} known)`);
+  }
+}
+
 async function refreshProxyPool() {
   if (proxyRefreshing) return;
   proxyRefreshing = true;
   try {
-    await Promise.all(proxyEndpoints.map((ep) => probeProxyEndpoint(ep)));
+    // Tier 1 first and on its own: its health is what decides whether Tier 2 is
+    // consulted at all, and it must not wait behind a slow public list.
+    await probeAll(proxyEndpoints, PROXY_PROBE_CONCURRENCY);
     const healthy = proxyEndpoints.filter((e) => e.healthy).length;
     const msg = `[proxy] health: ${healthy} clean / ${proxyEndpoints.length} configured`;
-    if (healthy === 0 && proxyEndpoints.length > 0) console.error(`${msg} — NO clean exit available`);
+    if (healthy === 0 && proxyEndpoints.length > 0) console.error(`${msg} — NO clean operator exit available`);
     else console.log(msg);
+    await refreshFallbackPool();
   } catch (e) { console.error("[proxy]", e); }
   finally { proxyRefreshing = false; }
 }
 
-function healthyProxies(): ProxyEndpoint[] { return proxyEndpoints.filter((e) => e.healthy); }
+function healthyTier1(): ProxyEndpoint[] { return proxyEndpoints.filter((e) => e.healthy); }
+function healthyTier2(): ProxyEndpoint[] { return PROXY_FALLBACK_ENABLED ? fallbackEndpoints.filter((e) => e.healthy) : []; }
+/** Every verified-clean exit, both tiers. */
+function healthyProxies(): ProxyEndpoint[] { return [...healthyTier1(), ...healthyTier2()]; }
+/** Everything we know about, for the admin view. */
+function allProxyEndpoints(): ProxyEndpoint[] { return [...proxyEndpoints, ...(PROXY_FALLBACK_ENABLED ? fallbackEndpoints : [])]; }
 
-/** Round-robin over the HEALTHY endpoints only. Null when there is no clean exit. */
+/**
+ * Round-robin over the HEALTHY endpoints only, TIER 1 FIRST. Tier 2 is reached
+ * only when not one operator box is verified clean, so the trusted exits are
+ * never given up while any of them works. Null when neither tier has a clean
+ * exit — the caller fails the spawn closed.
+ */
 function assignProxy(): ProxyEndpoint | null {
-  const healthy = healthyProxies();
-  if (!healthy.length) return null;
-  const pick = healthy[proxyCursor % healthy.length];
-  proxyCursor = (proxyCursor + 1) % healthy.length;
+  const t1 = healthyTier1();
+  if (t1.length) {
+    const pick = t1[proxyCursor % t1.length];
+    proxyCursor = (proxyCursor + 1) % t1.length;
+    noteServingTier(1);
+    return pick;
+  }
+  const t2 = healthyTier2();
+  if (!t2.length) { noteServingTier(0); return null; }
+  const pick = t2[fallbackCursor % t2.length];
+  fallbackCursor = (fallbackCursor + 1) % t2.length;
+  noteServingTier(2);
   return pick;
+}
+
+function noteServingTier(tier: 0 | 1 | 2) {
+  if (tier === servingTier) return;
+  servingTier = tier;
+  if (tier === 2) {
+    console.error("[proxy] TIER SWITCH: no operator exit is clean — sessions are now being assigned UNTRUSTED public fallback proxies, which can read and modify tenant traffic. Restore the VPN boxes.");
+  } else if (tier === 1) {
+    console.log("[proxy] TIER SWITCH: back on operator-run exits (tier 1).");
+  } else {
+    console.error("[proxy] TIER SWITCH: no clean exit in either tier — spawns are being refused.");
+  }
 }
 
 // Count a user's active machines (VMs + sessions) for the free-slot / cap.
@@ -993,6 +1185,10 @@ async function startServer() {
   // per-entry latency only, and their own assigned proxy is on their session row.
   app.get("/api/proxy/pool", (req, res) => {
     if (!userFromReq(req)) return res.status(401).json({ error: "not authenticated" });
+    // Deliberately tier-blind. Which tier is in play is operational detail for
+    // the operator (see /api/admin/state); publishing "we are currently on public
+    // fallback exits" to every logged-in tenant also publishes it to anyone who
+    // can register, and that is a targeting signal, not a safety feature.
     const healthy = healthyProxies();
     res.json({
       count: healthy.length,
@@ -1361,9 +1557,13 @@ async function startServer() {
     // CLOSED, exactly like the MIN_FREE_VRAM_MB preflight above — 503, no
     // session row, no dispatched job, nothing charged. Set REQUIRE_CLEAN_PROXY=0
     // to deliberately allow un-proxied sessions.
+    // Tier 1 (the operator's own boxes) is exhausted before any Tier 2 fallback
+    // exit is considered, and a Tier 2 exit had to pass the identical
+    // not-the-forbidden-IP probe to be in the running at all.
     const proxy = assignProxy(); // round-robin over provably-clean exits only
     if (!proxy && REQUIRE_CLEAN_PROXY) {
-      return res.status(503).json({ error: `no clean egress available — 0 of ${proxyEndpoints.length} configured proxies are verified clean, and this platform will not start an unproxied session. Nothing was charged; try again shortly.` });
+      const fb = PROXY_FALLBACK_ENABLED ? `, 0 of ${fallbackEndpoints.length} fallback exits` : "";
+      return res.status(503).json({ error: `no clean egress available — 0 of ${proxyEndpoints.length} configured proxies${fb} are verified clean, and this platform will not start an unproxied session. Nothing was charged; try again shortly.` });
     }
 
     const password = "Ub" + crypto.randomBytes(6).toString("hex") + "!";
@@ -1502,18 +1702,36 @@ async function startServer() {
       // signal that a box's VPN has dropped. `ip`/`location` stay populated so
       // the existing admin panel keeps rendering; `ip` falls back to the URL when
       // no egress was observed, so rows stay distinct.
-      proxyPool: proxyEndpoints.slice(0, 20).map((p) => ({
+      //
+      // `tier` and `tierLabel` are the honest answer to "whose exit is my tenant
+      // actually leaving through right now?". Tier 2 is a stranger's proxy that
+      // can read and modify their traffic; the operator must be able to SEE that
+      // they are running on those rather than infer it. Admin-gated only.
+      proxyPool: allProxyEndpoints().slice(0, 40).map((p) => ({
         url: p.url,
+        tier: p.tier,
+        tierLabel: p.tier === 1 ? "operator-vpn" : "public-fallback-UNTRUSTED",
         healthy: p.healthy,
         reachable: p.reachable,
         egressIp: p.egressIp,
         lastChecked: p.lastChecked,
         lastError: p.lastError,
         ip: p.egressIp ?? p.url,
-        location: p.healthy ? "clean" : p.egressIp ? "LEAKING" : "down",
+        location: p.healthy ? (p.tier === 1 ? "clean" : "clean (untrusted fallback)") : p.egressIp ? "LEAKING" : "down",
         latencyMs: p.latencyMs,
       })),
       requireCleanProxy: REQUIRE_CLEAN_PROXY,
+      egress: {
+        cleanTier1: healthyTier1().length,
+        cleanTier2: healthyTier2().length,
+        // True when the next spawn WOULD be handed an untrusted public proxy.
+        servingUntrustedFallback: healthyTier1().length === 0 && healthyTier2().length > 0,
+        fallbackEnabled: PROXY_FALLBACK_ENABLED,
+        fallbackSource: PROXY_FALLBACK_ENABLED ? PROXY_FALLBACK_SOURCE : null,
+        fallbackMax: PROXY_FALLBACK_MAX,
+        fallbackLastRefresh,
+        fallbackLastError,
+      },
     });
   });
 
@@ -1779,6 +1997,11 @@ ${opts.refreshSec ? `<div class="note">Retrying automatically every ${opts.refre
     console.error(`[proxy] no PROXY_ENDPOINTS configured — sessions have no clean egress. REQUIRE_CLEAN_PROXY=${REQUIRE_CLEAN_PROXY ? "1 (spawns will be refused)" : "0 (spawns will proceed UNPROXIED)"}`);
   } else if (PROXY_FORBIDDEN_EGRESS.size === 0) {
     console.error("[proxy] PROXY_FORBIDDEN_EGRESS is unset — the anonymity check cannot run, so no endpoint can be marked healthy. Set it to the operator's WAN IP(s).");
+  }
+  if (PROXY_FALLBACK_ENABLED) {
+    console.error(`[proxy] fallback tier ENABLED: up to ${PROXY_FALLBACK_MAX} candidates per refresh from ${PROXY_FALLBACK_SOURCE}. These are UNTRUSTED third-party proxies whose operators can read and modify tenant traffic; they are used only when NO operator exit is clean, and are held to the same forbidden-egress check.`);
+  } else {
+    console.log("[proxy] fallback tier disabled (PROXY_FALLBACK_ENABLED=0) — tier 1 only.");
   }
   refreshProxyPool();
   setInterval(refreshProxyPool, PROXY_REFRESH_MS);
