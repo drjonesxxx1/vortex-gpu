@@ -37,7 +37,9 @@ import urllib.parse
 import urllib.request
 
 GATEWAY  = os.environ.get("VORTEX_GATEWAY", "http://10.30.20.127:3000")
-SECRET   = os.environ.get("VORTEX_NODE_SECRET", "<set-VORTEX_NODE_SECRET-in-the-environment>")
+SECRET   = os.environ.get("VORTEX_NODE_SECRET", "")
+if not SECRET:
+    raise SystemExit("VORTEX_NODE_SECRET is required; refusing to start with a baked-in default")
 INTERVAL = int(os.environ.get("VORTEX_INTERVAL", "5"))
 HOSTNAME = socket.gethostname()
 
