@@ -56,8 +56,18 @@ const TRUST_PROXY = trustProxySetting(str(process.env.TRUST_PROXY, "loopback, li
 // ---- Proxmox ----
 const PVE_HOST = process.env.PVE_HOST || "10.30.20.85";
 const PVE_USER = process.env.PVE_USER || "root";
-const PVE_TEMPLATE_WIN = Number(process.env.PVE_TEMPLATE_WIN) || 504;
+// Legacy env. PVE_TEMPLATE_WIN was the single Windows template (historically
+// VMID 504). It is now a deprecated alias: it still seeds the win11 tier's
+// template when PVE_TEMPLATE_WIN11 is unset, so a running deploy that only set
+// PVE_TEMPLATE_WIN keeps cloning the same guest for os=windows.
+const PVE_TEMPLATE_WIN = Number(process.env.PVE_TEMPLATE_WIN) || 0;
 const PVE_TEMPLATE_LINUX = Number(process.env.PVE_TEMPLATE_LINUX) || 990;
+// New per-tier templates. win11 falls back to the legacy PVE_TEMPLATE_WIN if
+// set, else 810. comando defaults to 504 (the old Windows template VMID). The
+// LXC tier clones CT 991 with `pct`.
+const PVE_TEMPLATE_WIN11 = Number(process.env.PVE_TEMPLATE_WIN11) || PVE_TEMPLATE_WIN || 810;
+const PVE_TEMPLATE_COMANDO = Number(process.env.PVE_TEMPLATE_COMANDO) || 504;
+const PVE_TEMPLATE_CT = Number(process.env.PVE_TEMPLATE_CT) || 991;
 const PVE_VMID_START = Number(process.env.PVE_VMID_START) || 2000;
 // Names shown to tenants for the guest each template actually produces. The UI
 // reads these from /api/health rather than hardcoding a version, so swapping
@@ -79,7 +89,55 @@ const OWNER_SEED_PASSWORD = process.env.OWNER_SEED_PASSWORD || "";
 // GPU time for money that may never arrive, so settlement is the default and the
 // faster, riskier behaviour is opt-in via CREDIT_ON_PROCESSING=1.
 const CREDIT_ON_PROCESSING = process.env.CREDIT_ON_PROCESSING === "1";
+// The base billing unit. balance_minutes is denominated in "$1/hr-minutes":
+// one balance_minute is one minute of a $1/hr machine (= $1/60). Top-ups convert
+// USD -> balance_minutes at this base (see /api/btcpay/create-invoice), and a
+// machine at $P/hr therefore burns P balance_minutes per minute of runtime. This
+// stays 1.0 so the storefront's advertised price and the invoice conversion are
+// unchanged; per-tier pricing is expressed as the multiplier P below.
 const PRICE_USD_PER_HOUR = 1.0;
+
+// ---- Tier catalog ----
+// Every machine belongs to a tier. A tier fixes its marketing label, its price
+// (USD/hr, overridable per-tier by env), and the mechanism that provisions it:
+//   'qm'  -> Proxmox KVM guest via `qm clone <template>`
+//   'pct' -> Proxmox LXC container via `pct clone <template>`
+//   'gpu' -> Docker/noVNC GPU session on SESSION_NODE (/api/session/spawn)
+// The price a tenant is quoted at provision time is LOCKED onto the machine row
+// (price_usd_per_hour), so a later catalog/env change never re-prices a running
+// machine. Prices are env-overridable; the defaults are the confirmed catalog.
+type TierKind = "qm" | "pct" | "gpu";
+interface Tier {
+  key: string;
+  label: string;
+  priceUsdPerHour: number;
+  kind: TierKind;
+  template?: number;    // Proxmox VMID/CTID for qm/pct tiers
+  os?: "windows" | "linux";
+  protocol?: "rdp" | "ssh";
+  username?: string;    // default tenant login for the guest
+}
+const CATALOG: Tier[] = [
+  { key: "ubuntu-ct", label: "Ubuntu (headless CT)", priceUsdPerHour: num(process.env.PRICE_UBUNTU_CT, 1), kind: "pct", template: PVE_TEMPLATE_CT, os: "linux", protocol: "ssh", username: "rent" },
+  { key: "linux-vm", label: "Ubuntu Linux VM", priceUsdPerHour: num(process.env.PRICE_LINUX_VM, 2), kind: "qm", template: PVE_TEMPLATE_LINUX, os: "linux", protocol: "ssh", username: "rent" },
+  { key: "gpu", label: "GPU Session", priceUsdPerHour: num(process.env.PRICE_GPU, 5), kind: "gpu" },
+  { key: "win11", label: "Windows 11", priceUsdPerHour: num(process.env.PRICE_WIN11, 10), kind: "qm", template: PVE_TEMPLATE_WIN11, os: "windows", protocol: "rdp", username: "administrator" },
+  { key: "comando", label: "Comando VM", priceUsdPerHour: num(process.env.PRICE_COMANDO, 20), kind: "qm", template: PVE_TEMPLATE_COMANDO, os: "windows", protocol: "rdp", username: "administrator" },
+];
+const TIERS: Record<string, Tier> = Object.fromEntries(CATALOG.map((t) => [t.key, t]));
+// Price for a stored machine row: the locked-in price wins; else the tier's
+// current price; else the $1/hr base (a legacy row that predates these columns).
+function rowPrice(row: any, fallbackTier: string): number {
+  const p = Number(row?.price_usd_per_hour);
+  if (Number.isFinite(p) && p > 0) return p;
+  const t = TIERS[String(row?.tier ?? fallbackTier)];
+  return t ? t.priceUsdPerHour : PRICE_USD_PER_HOUR;
+}
+// Kind for a stored vm row. A NULL tier is a legacy qm clone.
+function rowKind(row: any): TierKind {
+  return TIERS[String(row?.tier)]?.kind ?? "qm";
+}
+
 const MAX_INVOICE_CENTS = 1_000_000; // $10,000 ceiling on a single top-up
 // A tenant session is advertised as a GPU machine. Handing one out on a node
 // whose VRAM is already consumed by another workload gives them a desktop that
@@ -91,6 +149,12 @@ const MIN_FREE_VRAM_MB = Number.isFinite(Number(process.env.MIN_FREE_VRAM_MB)) ?
 const SESSION_NODE = process.env.SESSION_NODE || "nightmare";
 const MAX_VMS_PER_USER = 3;
 const FREE_MACHINES = Number(process.env.FREE_MACHINES) || 1; // 1st machine free, 2nd+ billed
+// Billing tick. One tick charges each billable machine its tier's price (in
+// balance_minutes), so the default of one minute keeps the "$P/hr" contract
+// exact. TESTING ONLY: lower it to observe the sweep without waiting a minute —
+// it does NOT change the per-tick charge, only how often the charge is applied,
+// so anything other than 60000 in production bills faster than advertised.
+const BILLING_TICK_MS = Math.max(1000, num(process.env.BILLING_TICK_MS, 60_000));
 
 // Marketing tier label (what tenants see) — configurable, decoupled from truth.
 const GPU_SKU = process.env.GPU_SKU || "NVIDIA GeForce RTX 4080 SUPER 16GB";
@@ -265,6 +329,13 @@ function ensureColumn(table: string, col: string, ddl: string) {
 ensureColumn("users", "password_hash", "password_hash TEXT");
 ensureColumn("users", "unlimited", "unlimited INTEGER NOT NULL DEFAULT 0");
 ensureColumn("sessions", "proxy", "proxy TEXT");
+// Per-tier pricing: the tier key and the price (USD/hr) LOCKED in at provision
+// time. Nullable on purpose — a row that predates these columns bills at the
+// $1/hr base via rowPrice()/rowKind() and never crashes the sweep.
+ensureColumn("vms", "tier", "tier TEXT");
+ensureColumn("vms", "price_usd_per_hour", "price_usd_per_hour REAL");
+ensureColumn("sessions", "tier", "tier TEXT");
+ensureColumn("sessions", "price_usd_per_hour", "price_usd_per_hour REAL");
 
 function q(sql: string, ...p: (string | number)[]) { return db.prepare(sql).run(...p); }
 function one<T>(sql: string, ...p: (string | number)[]): T | undefined { return db.prepare(sql).get(...p) as T | undefined; }
@@ -358,6 +429,35 @@ async function reclaimVm(vmid: number): Promise<{ ok: boolean; out: string }> {
   return pve(["qm", "destroy", String(vmid), "--purge"]);
 }
 
+// ---- LXC (pct) driver ----
+// The ubuntu-ct tier is an LXC container, not a KVM guest. It mirrors the qm
+// path's structure: clone in the background, set a per-tenant password, start,
+// and reclaim with `pct destroy --purge` (same --skiplock reasoning as reclaimVm
+// — a locked CT must surface as a failed reclaim, never be forced through).
+async function cloneCt(template: number, ctid: number, name: string): Promise<{ ok: boolean; out: string }> {
+  return pve(["pct", "clone", String(template), String(ctid), "--hostname", name, "--full"]);
+}
+async function startCt(ctid: number): Promise<{ ok: boolean; out: string }> {
+  return pve(["pct", "start", String(ctid)]);
+}
+// Set the tenant's `rent` password inside the CT. `pct set --password` reads a
+// tty, so drive chpasswd through `pct exec` instead (equivalent, and scriptable
+// over SSH). The password charset (Vx<hex>!) is shell-safe inside single quotes.
+async function setCtPassword(ctid: number, user: string, pw: string): Promise<{ ok: boolean; out: string }> {
+  return pve(["pct", "exec", String(ctid), "--", "bash", "-c", `echo '${user}:${pw}' | chpasswd`]);
+}
+async function stopCt(ctid: number): Promise<{ ok: boolean; out: string }> {
+  return pve(["pct", "shutdown", String(ctid)]);
+}
+async function ctStatus(ctid: number): Promise<string> {
+  const r = await pve(["pct", "status", String(ctid)]);
+  const m = r.out.match(/status:\s*(\w+)/);
+  return m ? m[1] : "unknown";
+}
+async function reclaimCt(ctid: number): Promise<{ ok: boolean; out: string }> {
+  return pve(["pct", "destroy", String(ctid), "--purge"]);
+}
+
 // How often to re-read the host and correct drifted vm rows, and how old a row
 // must be before it is eligible (so a clone still in flight is never touched).
 const VM_RECONCILE_MS = Math.max(60_000, num(process.env.VM_RECONCILE_MS, 5 * 60_000));
@@ -385,10 +485,14 @@ async function reconcileVms(): Promise<void> {
   // holding one of the user's machine slots. The MIN_AGE cutoff below is what
   // protects a genuinely in-flight clone; past it, the row is abandoned by
   // definition and `qm list` is the truth. Still only ever UPDATEs `state`.
-  const rows = all<any>("SELECT id, vm_id, state, created_at FROM vms");
+  const rows = all<any>("SELECT id, vm_id, state, created_at, tier FROM vms");
   let fixed = 0;
   for (const row of rows) {
     if (Number(row.created_at) > cutoff) continue;
+    // `qm list` never enumerates LXC containers, so an ubuntu-ct row would be
+    // read as "gone" and wrongly walked to 'failed'. Leave pct-kind rows alone;
+    // their lifecycle is driven only by the provision/delete handlers.
+    if (rowKind(row) === "pct") continue;
     const hostState = onHost.get(Number(row.vm_id));
     const want = hostState === undefined ? "failed" : hostState === "running" ? "running" : "stopped";
     if (want !== String(row.state)) {
@@ -1165,6 +1269,10 @@ async function startServer() {
       requireCleanProxy: REQUIRE_CLEAN_PROXY,
       gpuSku: GPU_SKU, priceUsdPerHour: PRICE_USD_PER_HOUR, maxVmsPerUser: MAX_VMS_PER_USER,
       freeMachines: FREE_MACHINES,
+      // The five-tier catalog, so the storefront renders tiers and prices with
+      // NO hardcoding (honesty rule: every user-facing price comes from here).
+      // RESPONSE SHAPE ADDITION: new `catalog` array of {tier,label,priceUsdPerHour,kind}.
+      catalog: CATALOG.map((t) => ({ tier: t.key, label: t.label, priceUsdPerHour: t.priceUsdPerHour, kind: t.kind })),
       timestamp: new Date().toISOString(),
     });
   });
@@ -1327,8 +1435,20 @@ async function startServer() {
   app.post("/api/vms/provision", provisionLimit(), async (req, res) => {
     const user = userFromReq(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
-    const osName = str(req.body?.os, "windows");
-    if (osName !== "windows" && osName !== "linux") return res.status(400).json({ error: "os must be 'windows' or 'linux'" });
+    // Tier resolution. Prefer an explicit `tier`; fall back to the legacy
+    // os=windows|linux (windows -> win11, linux -> linux-vm) so existing callers
+    // keep working. The GPU tier is provisioned only via /api/session/spawn.
+    const tierKey = str(req.body?.tier, "");
+    let tier: Tier | undefined;
+    if (tierKey) {
+      tier = TIERS[tierKey];
+      if (!tier) return res.status(400).json({ error: `unknown tier — one of ${CATALOG.map((t) => t.key).join(", ")}` });
+      if (tier.kind === "gpu") return res.status(400).json({ error: "the GPU tier is provisioned via /api/session/spawn" });
+    } else {
+      const osName = str(req.body?.os, "windows");
+      if (osName !== "windows" && osName !== "linux") return res.status(400).json({ error: "os must be 'windows' or 'linux' (or pass an explicit tier)" });
+      tier = osName === "windows" ? TIERS["win11"] : TIERS["linux-vm"];
+    }
     // `app` is persisted and handed to node-side tooling; keep it to a safe charset.
     const appName = str(req.body?.app, "").slice(0, 64);
     if (appName && !/^[a-zA-Z0-9_. -]+$/.test(appName)) return res.status(400).json({ error: "invalid app" });
@@ -1339,31 +1459,49 @@ async function startServer() {
     const freeDenied = freeMachineDenial(req, user);
     if (freeDenied) return res.status(402).json({ error: freeDenied });
 
-    const isWin = osName === "windows";
-    const template = isWin ? PVE_TEMPLATE_WIN : PVE_TEMPLATE_LINUX;
+    const isPct = tier.kind === "pct";
+    const template = tier.template as number;
     const vmid = nextVmid() + Math.floor(Math.random() * 1000);
     const vmUid = "vm_" + crypto.randomBytes(6).toString("hex");
     const port = allocatePort(); // dedicated access port
     if (port === null) return res.status(503).json({ error: "no free ports — try again shortly" });
-    const name = isWin ? `vortex-win-${vmid}` : `vortex-lin-${vmid}`;
-    const username = isWin ? "administrator" : "rent";
+    const shortName = isPct ? "ct" : tier.os === "windows" ? "win" : "lin";
+    const name = `vortex-${shortName}-${vmid}`;
+    const username = tier.username as string;
+    const protocol = tier.protocol as "rdp" | "ssh";
     const password = "Vx" + crypto.randomBytes(6).toString("hex") + "!";
 
-    q("INSERT INTO vms (id,user_id,vm_id,node_hostname,name,os,sku,state,port,username,password,app,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-      vmUid, user.id, vmid, PVE_HOST, name, isWin ? "windows" : "linux", GPU_SKU, "provisioning", port, username, password, appName, Date.now());
+    // The tier and the price quoted RIGHT NOW are locked onto the row; a later
+    // catalog/env change never re-prices this machine. `os` keeps its historical
+    // meaning; `sku` becomes the tier's marketing label.
+    q("INSERT INTO vms (id,user_id,vm_id,node_hostname,name,os,sku,state,port,username,password,app,created_at,tier,price_usd_per_hour) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      vmUid, user.id, vmid, PVE_HOST, name, tier.os as string, tier.label, "provisioning", port, username, password, appName, Date.now(), tier.key, tier.priceUsdPerHour);
 
-    // clone + start (long-running; runs in background)
-    cloneVm(template, vmid, name).then(async (r) => {
-      if (!r.ok) { q("UPDATE vms SET state='failed' WHERE id=?", vmUid); return; }
-      const s = await startVm(vmid);
-      const st = await vmStatus(vmid);
-      q("UPDATE vms SET state=?, ip=? WHERE id=?", s.ok ? "running" : st, PVE_HOST, vmUid);
-    });
+    // clone + start (long-running; runs in background). Route on the tier's
+    // mechanism: LXC via pct, KVM via qm.
+    if (isPct) {
+      cloneCt(template, vmid, name).then(async (r) => {
+        if (!r.ok) { q("UPDATE vms SET state='failed' WHERE id=?", vmUid); return; }
+        await setCtPassword(vmid, username, password);
+        const s = await startCt(vmid);
+        q("UPDATE vms SET state=?, ip=? WHERE id=?", s.ok ? "running" : "failed", PVE_HOST, vmUid);
+      });
+    } else {
+      cloneVm(template, vmid, name).then(async (r) => {
+        if (!r.ok) { q("UPDATE vms SET state='failed' WHERE id=?", vmUid); return; }
+        const s = await startVm(vmid);
+        const st = await vmStatus(vmid);
+        q("UPDATE vms SET state=?, ip=? WHERE id=?", s.ok ? "running" : st, PVE_HOST, vmUid);
+      });
+    }
 
     recordFreeMachine(req, user);
     res.json({
-      vmId: vmUid, os: isWin ? "windows" : "linux", sku: GPU_SKU, state: "provisioning",
-      access: isWin ? { protocol: "rdp", host: PVE_HOST, port, username, password } : { protocol: "ssh", host: PVE_HOST, port, username, password },
+      // RESPONSE SHAPE ADDITION: `tier` and `priceUsdPerHour` now accompany the
+      // existing fields. `os` and `sku` are unchanged in type.
+      vmId: vmUid, tier: tier.key, priceUsdPerHour: tier.priceUsdPerHour,
+      os: tier.os, sku: tier.label, state: "provisioning",
+      access: { protocol, host: PVE_HOST, port, username, password },
       app: appName,
     });
   });
@@ -1387,9 +1525,13 @@ async function startServer() {
     // pve() resolves {ok:false} rather than rejecting, so an ignored result here
     // recorded a guest as stopped while it was still running -- unbilled,
     // uncounted, and still consuming the host. Escalate, then verify.
-    let r = await stopVm(vm.vm_id);
-    if (!r.ok) r = await pve(["qm", "stop", String(vm.vm_id)]);
-    const st = await vmStatus(vm.vm_id);
+    // Route the shutdown on the row's kind: pct for an LXC container, qm for a
+    // KVM guest. Both escalate from a graceful shutdown to a hard stop, then
+    // verify with the matching status command.
+    const isPct = rowKind(vm) === "pct";
+    let r = isPct ? await stopCt(vm.vm_id) : await stopVm(vm.vm_id);
+    if (!r.ok) r = await pve([isPct ? "pct" : "qm", "stop", String(vm.vm_id)]);
+    const st = isPct ? await ctStatus(vm.vm_id) : await vmStatus(vm.vm_id);
     if (st === "running") {
       console.error(`[vms] ${vm.id} (vmid ${vm.vm_id}) would not stop; leaving in 'stopping' so it stays billed and counted`);
       return res.status(502).json({ error: "the machine did not stop — it is still running and still billed; try again shortly" });
@@ -1415,7 +1557,10 @@ async function startServer() {
     // reclaim failed, the guest would be stranded with nothing left to retry
     // from. A guest that is already gone counts as success, which is also what
     // heals rows whose guest was removed by hand.
-    const rec = await reclaimVm(vm.vm_id);
+    // Dispatch the reclaim on the row's kind: an LXC container must be torn down
+    // with `pct destroy`, a KVM guest with `qm destroy`. A NULL-tier legacy row
+    // is a qm clone (rowKind default).
+    const rec = rowKind(vm) === "pct" ? await reclaimCt(vm.vm_id) : await reclaimVm(vm.vm_id);
     if (!rec.ok && !/does not exist|no such/i.test(rec.out)) {
       console.error(`[vms] reclaim of vmid ${vm.vm_id} failed, keeping row ${vm.id}: ${rec.out.slice(0, 200)}`);
       return res.status(502).json({ error: "could not reclaim the machine on the host — nothing was deleted; try again shortly" });
@@ -1569,8 +1714,11 @@ async function startServer() {
     const password = "Ub" + crypto.randomBytes(6).toString("hex") + "!";
     const id = "ses_" + crypto.randomBytes(8).toString("hex");
 
-    q("INSERT INTO sessions (id,user_id,instance_id,node_hostname,node_ip,port,password,resolution,proxy,state,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-      id, user.id, instanceId, hostname, node.ip, port, password, reso, proxy?.url ?? null, "provisioning", Date.now());
+    // Every session is the GPU tier; lock its tier and price onto the row so the
+    // sweep bills it at the GPU rate (not the flat $1/hr it used to assume).
+    const gpuTier = TIERS["gpu"];
+    q("INSERT INTO sessions (id,user_id,instance_id,node_hostname,node_ip,port,password,resolution,proxy,state,created_at,tier,price_usd_per_hour) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      id, user.id, instanceId, hostname, node.ip, port, password, reso, proxy?.url ?? null, "provisioning", Date.now(), gpuTier.key, gpuTier.priceUsdPerHour);
     dispatchJob(hostname, "provision_ubuntu", "", { instanceId, port, password, resolution: reso, proxy: proxy?.url ?? null });
 
     recordFreeMachine(req, user);
@@ -1795,7 +1943,7 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // ===== BILLING ($1/hr, tick every minute, first machine free, auto-stop at 0) =====
+  // ===== BILLING (per-tier price, tick every minute, first machine free, auto-stop at 0) =====
   setInterval(() => {
     try {
       // Bill `stopping` too. A guest whose shutdown is slow or stuck is still
@@ -1804,15 +1952,27 @@ async function startServer() {
       // a guest that ignores ACPI.
       const runningVms = all<any>(`SELECT * FROM vms WHERE state IN ('running','stopping')`);
       const runningSessions = all<any>(`SELECT * FROM sessions WHERE state IN ('running','stopping')`);
-      const perUser = new Map<string, number>();
-      for (const r of runningVms) perUser.set(r.user_id, (perUser.get(r.user_id) || 0) + 1);
-      for (const s of runningSessions) perUser.set(s.user_id, (perUser.get(s.user_id) || 0) + 1);
-      for (const [userId, total] of perUser) {
+      // Every live machine, grouped by owner, each carrying its per-minute price
+      // in balance_minutes (= its tier's USD/hr; a $5/hr machine burns 5/min).
+      const perUser = new Map<string, { kind: "vm" | "session"; row: any; price: number }[]>();
+      for (const r of runningVms) {
+        const arr = perUser.get(r.user_id) ?? []; arr.push({ kind: "vm", row: r, price: rowPrice(r, "linux-vm") }); perUser.set(r.user_id, arr);
+      }
+      for (const s of runningSessions) {
+        const arr = perUser.get(s.user_id) ?? []; arr.push({ kind: "session", row: s, price: rowPrice(s, "gpu") }); perUser.set(s.user_id, arr);
+      }
+      for (const [userId, machines] of perUser) {
         const acct = one<any>("SELECT unlimited, balance_minutes FROM users WHERE id=?", userId);
         if (!acct || acct.unlimited) continue; // unlimited accounts never bill or auto-stop
-        const billable = Math.max(0, total - FREE_MACHINES); // first machine free
-        if (billable <= 0) continue;
-        q("UPDATE users SET balance_minutes = MAX(0, balance_minutes - ?) WHERE id=?", billable, userId);
+        // Spare the oldest FREE_MACHINES across ALL tiers, then bill each of the
+        // rest at ITS tier's rate. Oldest-first keeps the free slot stable.
+        const mine = machines.sort((a, b) => Number(a.row.created_at) - Number(b.row.created_at));
+        const billableRows = mine.slice(FREE_MACHINES);
+        if (billableRows.length === 0) continue;
+        // Integer column: sum the per-machine prices and round the total.
+        const charge = Math.round(billableRows.reduce((sum, m) => sum + m.price, 0));
+        if (charge <= 0) continue;
+        q("UPDATE users SET balance_minutes = MAX(0, balance_minutes - ?) WHERE id=?", charge, userId);
         const u = one<any>("SELECT balance_minutes FROM users WHERE id=?", userId);
         if (u && u.balance_minutes <= 0) {
           // Spare the free allowance. Stopping every machine at zero balance
@@ -1820,20 +1980,18 @@ async function startServer() {
           // the provision routes makes -- a customer who ran out of credit lost
           // the machine they were still entitled to. Oldest machines are the
           // ones kept, so the free slot is stable rather than arbitrary.
-          const mine = [
-            ...runningVms.filter((x) => x.user_id === userId).map((r) => ({ kind: "vm" as const, row: r })),
-            ...runningSessions.filter((x) => x.user_id === userId).map((s) => ({ kind: "session" as const, row: s })),
-          ].sort((a, b) => Number(a.row.created_at) - Number(b.row.created_at));
-          for (const { kind, row } of mine.slice(FREE_MACHINES)) {
+          for (const { kind, row } of billableRows) {
             if (row.state === "stopping") continue; // already on its way down
             if (kind === "vm") {
               q("UPDATE vms SET state='stopping' WHERE id=?", row.id);
               // Verify it actually stopped. Blindly writing 'stopped' recorded a
-              // live guest as off: uncounted, unbilled, still on the host.
+              // live guest as off: uncounted, unbilled, still on the host. Route
+              // the shutdown on the row's kind (pct for LXC, qm for KVM).
+              const isPct = rowKind(row) === "pct";
               void (async () => {
-                let r = await stopVm(row.vm_id);
-                if (!r.ok) r = await pve(["qm", "stop", String(row.vm_id)]);
-                if ((await vmStatus(row.vm_id)) === "running") {
+                let r = isPct ? await stopCt(row.vm_id) : await stopVm(row.vm_id);
+                if (!r.ok) r = await pve([isPct ? "pct" : "qm", "stop", String(row.vm_id)]);
+                if ((isPct ? await ctStatus(row.vm_id) : await vmStatus(row.vm_id)) === "running") {
                   console.error(`[billing] vmid ${row.vm_id} would not stop; leaving 'stopping' so it stays billed`);
                   return;
                 }
@@ -1847,7 +2005,7 @@ async function startServer() {
         }
       }
     } catch (e) { console.error("[billing]", e); }
-  }, 60_000);
+  }, BILLING_TICK_MS);
 
   // ===== SESSION noVNC PROXY (WebSocket-capable, branded failure pages) =====
   // Branded VortexGPU page shown instead of raw proxy errors — dark theme to
@@ -2018,22 +2176,26 @@ ${opts.refreshSec ? `<div class="note">Retrying automatically every ${opts.refre
   // signal. Non-blocking and advisory -- a hypervisor that is briefly
   // unreachable must not stop the gateway from serving.
   void (async () => {
-    for (const [label, vmid] of [["windows", PVE_TEMPLATE_WIN], ["linux", PVE_TEMPLATE_LINUX]] as const) {
-      const r = await pve(["qm", "config", String(vmid)]);
-      if (!r.ok) { console.warn(`[templates] could not verify ${label} template ${vmid}: ${r.out.slice(0, 120).trim()}`); continue; }
-      const name = r.out.match(/^name:\s*(.+)$/m)?.[1]?.trim() ?? "?";
+    // One check per clone-backed tier, using the right config command (`qm
+    // config` for KVM, `pct config` for LXC).
+    for (const t of CATALOG) {
+      if (t.kind === "gpu" || !t.template) continue;
+      const cmd = t.kind === "pct" ? "pct" : "qm";
+      const r = await pve([cmd, "config", String(t.template)]);
+      if (!r.ok) { console.warn(`[templates] could not verify ${t.key} template ${t.template}: ${r.out.slice(0, 120).trim()}`); continue; }
+      const name = r.out.match(/^name:\s*(.+)$/m)?.[1]?.trim() ?? r.out.match(/^hostname:\s*(.+)$/m)?.[1]?.trim() ?? "?";
       if (!/^template:\s*1\s*$/m.test(r.out)) {
-        console.error(`[templates] ${label} template ${vmid} ("${name}") is NOT a template — cloning it will fail`);
+        console.error(`[templates] ${t.key} template ${t.template} ("${name}") is NOT a template — cloning it will fail`);
       } else {
-        console.log(`[templates] ${label} -> ${vmid} "${name}" ok`);
+        console.log(`[templates] ${t.key} -> ${t.template} "${name}" ok`);
       }
     }
   })();
 
   const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`[VortexGPU] rent-a-PC gateway on :${PORT}`);
-    console.log(`[VortexGPU] Proxmox ${PVE_HOST} | win tpl ${PVE_TEMPLATE_WIN} | linux tpl ${PVE_TEMPLATE_LINUX}`);
-    console.log(`[VortexGPU] GPU SKU: ${GPU_SKU} | $${PRICE_USD_PER_HOUR}/hr | ${FREE_MACHINES} free machine(s)`);
+    console.log(`[VortexGPU] Proxmox ${PVE_HOST} | tiers: ${CATALOG.map((t) => `${t.key}=$${t.priceUsdPerHour}/hr(${t.kind}${t.template ? " " + t.template : ""})`).join(" | ")}`);
+    console.log(`[VortexGPU] GPU SKU: ${GPU_SKU} | base $${PRICE_USD_PER_HOUR}/hr | ${FREE_MACHINES} free machine(s)`);
   });
   server.on("upgrade", sessionProxy.upgrade);
 }
