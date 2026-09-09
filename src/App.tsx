@@ -16,6 +16,9 @@ import { vmEndpoint } from './connect';
 import {
   type Capacity, type Health, fmtVram, readCapacity, useHealth,
 } from './health';
+import {
+  type TierCard, catalogRange, readCatalog, resolveRowTier,
+} from './catalog';
 import './index.css';
 
 /** three.js is ~460 kB of the bundle and the hero renders fine without it for a
@@ -43,7 +46,16 @@ const Cyber3DCanvas = lazy(() =>
 
 /* ------------------------------------------------------------------ types */
 
-interface ApiVm {
+/** Fields the gateway is adding to vm and session rows so a machine card can
+ *  name its tier and per-hour price. All optional — an older gateway omits
+ *  them and the card falls back to its os-derived label with no price. */
+interface TieredRow {
+  tier?: string | null;
+  tier_label?: string | null;
+  price_per_hour?: number | null;
+}
+
+interface ApiVm extends TieredRow {
   id: string; vm_id: number; os: string; sku: string; state: string;
   /** Host address of the guest. NULL while `provisioning` — the clone writes it
    *  at the same moment it flips the row to `running`. */
@@ -52,7 +64,7 @@ interface ApiVm {
   app: string | null; created_at: number;
 }
 
-interface ApiSession {
+interface ApiSession extends TieredRow {
   id: string; instance_id: string; node_hostname: string; port: number;
   password: string; resolution: string; proxy: string | null; state: string; created_at: number;
 }
@@ -301,9 +313,16 @@ function Dashboard({
     [busy, post, refresh],
   );
 
-  const spawnSession = () => run('session', '/api/session/spawn', { resolution: '1440x900' }, 'Could not start session');
-  const deployVm = (os: 'windows' | 'linux') =>
-    run(os, '/api/vms/provision', { os }, `Could not deploy ${os === 'windows' ? 'Windows' : 'Linux'}`);
+  /** Deploy a catalog tier. The GPU tier spawns an in-browser session; every
+   *  other tier provisions a VM/CT, passing only the `tier` the gateway needs.
+   *  The busy key is the tier id, so each card spins independently. */
+  const deployTier = (card: TierCard) => {
+    if (card.provision === 'session') {
+      run(card.tier, '/api/session/spawn', { resolution: '1440x900' }, 'Could not start session');
+    } else {
+      run(card.tier, '/api/vms/provision', { tier: card.tier }, `Could not deploy ${card.label}`);
+    }
+  };
   const destroySession = (id: string) => run(`d:${id}`, '/api/session/destroy', { sessionId: id }, 'Could not stop session');
   const destroyVm = (id: string) => run(`d:${id}`, '/api/vms/destroy', { vmId: id }, 'Could not stop machine');
 
@@ -347,6 +366,31 @@ function Dashboard({
    *  silently leaves the storefront advertising an OS tenants do not get. */
   const winLabel = health?.windowsLabel || 'Windows';
   const linLabel = health?.linuxLabel || 'Linux';
+
+  /** The five-tier catalog, cheapest first. Falls back to a hardcoded table
+   *  until the gateway ships `health.catalog`; when present, the wire wins. */
+  const catalog = useMemo(() => readCatalog(health), [health]);
+  const range = catalogRange(catalog);
+  const gpuCard = useMemo(() => catalog.find((c) => c.provision === 'session') ?? null, [catalog]);
+  const spawnGpu = () => { if (gpuCard) deployTier(gpuCard); };
+  const gpuBusyKey = gpuCard?.tier ?? 'gpu';
+
+  /** Per-machine price comes from the row's resolved tier; when the gateway has
+   *  not tagged the row yet we fall back to the account base rate (a real API
+   *  figure), never to an invented number. */
+  const priceOfRow = (row: TieredRow): number => resolveRowTier(row, catalog)?.price ?? meta.price;
+  /** Live spend: sum the per-hour price of running machines beyond the free
+   *  allowance, treating the cheapest as the free ones (the user-favourable
+   *  reading of "first N free"). */
+  const burnPerHr = useMemo(() => {
+    if (unlimited) return 0;
+    const prices = [...sessions, ...vms]
+      .filter((r) => r.state === 'running')
+      .map(priceOfRow)
+      .sort((a, b) => a - b);
+    return prices.slice(meta.freeMachines).reduce((sum, p) => sum + p, 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions, vms, catalog, meta.freeMachines, meta.price, unlimited]);
 
   return (
     <div className="min-h-screen bg-ink-950 text-zinc-100">
@@ -490,7 +534,7 @@ function Dashboard({
                 ? 'No concurrency limit'
                 : freeSlotsLeft > 0
                   ? `${freeSlotsLeft} free slot${freeSlotsLeft === 1 ? '' : 's'} remaining`
-                  : `${billableRunning} billed at $${meta.price}/hr each`}
+                  : `${billableRunning} billed · $${burnPerHr.toFixed(2)}/hr`}
             </p>
           </div>
 
@@ -499,7 +543,7 @@ function Dashboard({
               <Zap className="w-3.5 h-3.5" aria-hidden="true" /> Burn rate
             </div>
             <div className="mt-2 font-mono text-3xl font-bold text-zinc-100">
-              ${(billableRunning * meta.price).toFixed(2)}
+              ${burnPerHr.toFixed(2)}
               <span className="text-lg text-zinc-600">/hr</span>
             </div>
             <p className="mt-1 text-xs text-zinc-500">
@@ -515,49 +559,27 @@ function Dashboard({
           <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
             <h2 id="deploy-h" className="text-xl font-bold tracking-tight">Deploy a machine</h2>
             <p className="text-xs text-zinc-500">
-              ${meta.price}/hr · first {meta.freeMachines} machine{meta.freeMachines === 1 ? '' : 's'} free
+              {range ? `from $${range.min}/hr` : 'per-hour pricing'} · first {meta.freeMachines} machine{meta.freeMachines === 1 ? '' : 's'} free
             </p>
           </div>
-          <div className="grid gap-4 md:grid-cols-3">
-            <ProductCard
-              icon={<Terminal className="w-6 h-6" aria-hidden="true" />}
-              accent="emerald"
-              name="Ubuntu GPU Session"
-              tag="In-browser desktop"
-              desc="A full Ubuntu desktop streamed to your browser, with the GPU attached. Install anything and run CUDA jobs. The card is shared, so check the VRAM headroom above before a heavy run."
-              cta="Spawn session"
-              onClick={spawnSession}
-              busy={busy === 'session'}
-              disabled={!!busy || !!sessionBlocked}
-              blockedReason={sessionBlocked}
-              onBlockedAction={needsBalance && !atCap ? () => setPayOpen(true) : undefined}
-            />
-            <ProductCard
-              icon={<Laptop className="w-6 h-6" aria-hidden="true" />}
-              accent="cyan"
-              name={winLabel}
-              tag="RDP · full desktop"
-              desc={`A real ${winLabel} VM over RDP with administrator access. GUI apps and general compute — CPU and RAM only, no GPU attached.`}
-              cta="Deploy Windows"
-              onClick={() => deployVm('windows')}
-              busy={busy === 'windows'}
-              disabled={!!busy || !!blocked}
-              blockedReason={blocked}
-              onBlockedAction={needsBalance && !atCap ? () => setPayOpen(true) : undefined}
-            />
-            <ProductCard
-              icon={<Server className="w-6 h-6" aria-hidden="true" />}
-              accent="violet"
-              name="Linux"
-              tag="SSH · headless"
-              desc="Debian 12 over SSH for headless compute, Docker and long-running server jobs — CPU and RAM only, no GPU attached."
-              cta="Deploy Linux"
-              onClick={() => deployVm('linux')}
-              busy={busy === 'linux'}
-              disabled={!!busy || !!blocked}
-              blockedReason={blocked}
-              onBlockedAction={needsBalance && !atCap ? () => setPayOpen(true) : undefined}
-            />
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {catalog.map((card) => {
+              /* The GPU tier is the only one the VRAM preflight gates; every
+                 other tier answers to the account-level block alone. */
+              const cardBlocked = card.provision === 'session' ? sessionBlocked : blocked;
+              return (
+                <React.Fragment key={card.tier}>
+                  <ProductCard
+                    card={card}
+                    onClick={() => deployTier(card)}
+                    busy={busy === card.tier}
+                    disabled={!!busy || !!cardBlocked}
+                    blockedReason={cardBlocked}
+                    onBlockedAction={needsBalance && !atCap ? () => setPayOpen(true) : undefined}
+                  />
+                </React.Fragment>
+              );
+            })}
           </div>
         </section>
 
@@ -585,9 +607,9 @@ function Dashboard({
               <div className="mt-6 flex flex-wrap justify-center gap-3">
                 <button
                   type="button"
-                  onClick={() => { if (!busy && !sessionBlocked) spawnSession(); }}
-                  aria-disabled={!!busy || !!sessionBlocked}
-                  aria-busy={busy === 'session'}
+                  onClick={() => { if (!busy && !sessionBlocked && gpuCard) spawnGpu(); }}
+                  aria-disabled={!!busy || !!sessionBlocked || !gpuCard}
+                  aria-busy={busy === gpuBusyKey}
                   aria-describedby={sessionBlocked ? 'empty-spawn-why' : undefined}
                   title={sessionBlocked ?? undefined}
                   className={cx(
@@ -595,8 +617,8 @@ function Dashboard({
                     'aria-disabled:pointer-events-none aria-disabled:opacity-45',
                   )}
                 >
-                  {busy === 'session' ? <Spinner /> : <Terminal className="w-4 h-4" aria-hidden="true" />}
-                  {busy === 'session' ? 'Starting…' : 'Spawn Ubuntu session'}
+                  {busy === gpuBusyKey ? <Spinner /> : <Terminal className="w-4 h-4" aria-hidden="true" />}
+                  {busy === gpuBusyKey ? 'Starting…' : 'Spawn GPU session'}
                 </button>
                 <button type="button" onClick={() => setPayOpen(true)} className={cx(BTN_GHOST, 'px-5 py-2.5 text-sm')}>
                   <Bitcoin className="w-4 h-4" aria-hidden="true" /> Buy minutes
@@ -613,6 +635,7 @@ function Dashboard({
                   <SessionCard
                     s={s}
                     gpuSku={meta.gpuSku}
+                    tierInfo={resolveRowTier(s, catalog)}
                     now={nowTs}
                     busy={busy === `d:${s.id}`}
                     deleting={busy === `x:${s.id}`}
@@ -628,6 +651,7 @@ function Dashboard({
                     vm={vm}
                     winLabel={winLabel}
                     linLabel={linLabel}
+                    tierInfo={resolveRowTier(vm, catalog)}
                     now={nowTs}
                     busy={busy === `d:${vm.id}`}
                     deleting={busy === `x:${vm.id}`}
@@ -642,8 +666,8 @@ function Dashboard({
         </section>
 
         <p className="border-t border-white/10 pt-6 text-center text-xs text-zinc-600">
-          ${meta.price}/hr per billed machine · first {meta.freeMachines} free ·{' '}
-          {unlimited ? 'unlimited' : meta.maxMachines} concurrent max · Bitcoin via BTCPay
+          {range ? (range.min === range.max ? `$${range.min}/hr` : `$${range.min}–$${range.max}/hr by tier`) : 'per-hour pricing'} ·
+          {' '}first {meta.freeMachines} free · {unlimited ? 'unlimited' : meta.maxMachines} concurrent max · Bitcoin via BTCPay
         </p>
         </>
         )}
@@ -724,15 +748,52 @@ function GpuCapacityCard({ capacity, gpuSku }: { capacity: Capacity; gpuSku: str
   );
 }
 
+/** Icons for each tier's presentation `iconKey`. */
+const TIER_ICON: Record<TierCard['iconKey'], React.ReactNode> = {
+  terminal: <Terminal className="w-6 h-6" aria-hidden="true" />,
+  laptop: <Laptop className="w-6 h-6" aria-hidden="true" />,
+  server: <Server className="w-6 h-6" aria-hidden="true" />,
+  monitor: <Monitor className="w-6 h-6" aria-hidden="true" />,
+};
+
+/** The connection-method line under a tier's name. */
+function connectTag(via: TierCard['connectVia']): string {
+  return via === 'In-browser' ? 'In-browser · noVNC desktop'
+    : via === 'RDP' ? 'RDP · full desktop'
+      : 'SSH · terminal';
+}
+
+/**
+ * The GPU badge — same wording and styling as GuideView's, so "GPU attached" /
+ * "No GPU attached" reads identically wherever a machine type is drawn. Only
+ * the GPU session is ever attached; the badge never lies about the VMs/CTs.
+ */
+function GpuBadge({ attached }: { attached: boolean }) {
+  return (
+    <p
+      className={cx(
+        'mt-3 inline-flex items-center gap-1.5 self-start rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ring-1',
+        attached
+          ? 'bg-emerald-400/15 text-emerald-300 ring-emerald-400/30'
+          : 'bg-white/5 text-zinc-400 ring-white/10',
+      )}
+    >
+      <Cpu className="h-3 w-3" aria-hidden="true" />
+      {attached ? 'GPU attached' : 'No GPU attached'}
+    </p>
+  );
+}
+
 function ProductCard({
-  icon, name, tag, desc, cta, onClick, accent, busy, disabled, blockedReason, onBlockedAction,
+  card, onClick, busy, disabled, blockedReason, onBlockedAction,
 }: {
-  icon: React.ReactNode; name: string; tag: string; desc: string; cta: string;
-  onClick: () => void; accent: keyof typeof ACCENTS;
+  card: TierCard;
+  onClick: () => void;
   busy: boolean; disabled: boolean; blockedReason: string | null;
   onBlockedAction?: () => void;
 }) {
-  const a = ACCENTS[accent];
+  const a = ACCENTS[card.accent];
+  const cta = card.provision === 'session' ? 'Spawn session' : 'Deploy';
   const showTopUp = !!blockedReason && !!onBlockedAction;
   /** A blocked control has to say why in a way a keyboard or screen-reader user
    *  can actually reach. A natively `disabled` button drops out of the tab order
@@ -743,12 +804,18 @@ function ProductCard({
   const inert = disabled || busy;
   return (
     <div className={cx('surface surface-hover flex flex-col rounded-2xl p-5', a.ring)}>
-      <div className={cx('mb-3 flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-white/5', a.text)}>
-        {icon}
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <span className={cx('flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-white/5', a.text)}>
+          {TIER_ICON[card.iconKey]}
+        </span>
+        <span className="text-right font-mono text-2xl font-bold leading-none text-zinc-100">
+          ${card.priceUsdPerHour}<span className="text-sm text-zinc-600">/hr</span>
+        </span>
       </div>
-      <h3 className="font-semibold text-zinc-100">{name}</h3>
-      <p className={cx('mt-0.5 text-[11px] font-medium uppercase tracking-wider', a.text)}>{tag}</p>
-      <p className="mt-3 flex-1 text-sm leading-relaxed text-zinc-400">{desc}</p>
+      <h3 className="font-semibold text-zinc-100">{card.label}</h3>
+      <p className={cx('mt-0.5 text-[11px] font-medium uppercase tracking-wider', a.text)}>{connectTag(card.connectVia)}</p>
+      <p className="mt-3 flex-1 text-sm leading-relaxed text-zinc-400">{card.blurb}</p>
+      <GpuBadge attached={card.gpuAttached} />
 
       {showTopUp ? (
         <button type="button" onClick={onBlockedAction} className={cx(BTN_AMBER, 'mt-5 w-full py-3 text-sm')}>
@@ -781,9 +848,13 @@ function ProductCard({
 }
 
 function SessionCard({
-  s, gpuSku, now, busy, deleting, disabled, onStop, onDelete,
+  s, gpuSku, tierInfo, now, busy, deleting, disabled, onStop, onDelete,
 }: {
-  s: ApiSession; gpuSku: string; now: number; busy: boolean; deleting: boolean;
+  s: ApiSession; gpuSku: string;
+  /** Tier label + per-hour price from the row, or null when the gateway has not
+   *  tagged it — the card then keeps its generic name and shows no price. */
+  tierInfo: { label: string; price: number | null } | null;
+  now: number; busy: boolean; deleting: boolean;
   disabled: boolean; onStop: () => void; onDelete: () => void;
 }) {
   const isRunning = s.state === 'running';
@@ -806,11 +877,16 @@ function SessionCard({
             <Terminal className="w-4 h-4" aria-hidden="true" />
           </span>
           <div className="min-w-0">
-            <h3 className="truncate font-semibold">Ubuntu GPU Session</h3>
+            <h3 className="truncate font-semibold">{tierInfo?.label ?? 'GPU Session'}</h3>
             <p className="truncate font-mono text-[11px] text-zinc-500">{s.instance_id} · {gpuSku}</p>
           </div>
         </div>
-        <StateBadge state={s.state} />
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          <StateBadge state={s.state} />
+          {tierInfo?.price != null && (
+            <span className="font-mono text-[11px] text-zinc-500">${tierInfo.price}/hr</span>
+          )}
+        </div>
       </header>
 
       <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-[11px]">
@@ -884,12 +960,15 @@ function SessionCard({
 }
 
 function VmCard({
-  vm, now, busy, deleting, disabled, onStop, onDelete, winLabel, linLabel,
+  vm, now, busy, deleting, disabled, onStop, onDelete, winLabel, linLabel, tierInfo,
 }: {
   vm: ApiVm; now: number; busy: boolean; deleting: boolean;
   disabled: boolean; onStop: () => void; onDelete: () => void;
   /** Guest names from /api/health — see the note where they are derived. */
   winLabel: string; linLabel: string;
+  /** Tier label + per-hour price from the row, or null when the gateway has not
+   *  tagged it — the card then falls back to the os-derived label, no price. */
+  tierInfo: { label: string; price: number | null } | null;
 }) {
   const isWin = vm.os === 'windows';
   const isActive = vm.state === 'running' || vm.state === 'provisioning';
@@ -910,11 +989,16 @@ function VmCard({
             {isWin ? <Laptop className="w-4 h-4" aria-hidden="true" /> : <Server className="w-4 h-4" aria-hidden="true" />}
           </span>
           <div className="min-w-0">
-            <h3 className="truncate font-semibold">{isWin ? winLabel : linLabel}</h3>
+            <h3 className="truncate font-semibold">{tierInfo?.label ?? (isWin ? winLabel : linLabel)}</h3>
             <p className="truncate font-mono text-[11px] text-zinc-500">#{vm.vm_id} · {vm.sku}</p>
           </div>
         </div>
-        <StateBadge state={vm.state} />
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          <StateBadge state={vm.state} />
+          {tierInfo?.price != null && (
+            <span className="font-mono text-[11px] text-zinc-500">${tierInfo.price}/hr</span>
+          )}
+        </div>
       </header>
 
       {vm.state === 'provisioning' && (
@@ -1211,6 +1295,7 @@ function AuthGate({ onAuthed, onBack }: { onAuthed: (a: Auth) => void; onBack: (
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const health = useHealth();
+  const authRange = catalogRange(readCatalog(health));
 
   // Mirrors the server's validation exactly, so users never round-trip for it.
   const usernameOk = /^[a-zA-Z0-9_.-]{3,32}$/.test(username.trim());
@@ -1357,7 +1442,7 @@ function AuthGate({ onAuthed, onBack }: { onAuthed: (a: Auth) => void; onBack: (
         </form>
 
         <p className="mt-5 text-center text-[11px] text-zinc-600">
-          ${health?.priceUsdPerHour ?? 1}/hr · first {health?.freeMachines ?? 1} machine free · up to{' '}
+          {authRange ? `from $${authRange.min}/hr` : 'per-hour pricing'} · first {health?.freeMachines ?? 1} machine free · up to{' '}
           {health?.maxVmsPerUser ?? 3} concurrent · Bitcoin via BTCPay
         </p>
       </div>
@@ -1416,10 +1501,14 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
   const health = useHealth();
   const [menuOpen, setMenuOpen] = useState(false);
 
-  const price = health?.priceUsdPerHour ?? 1;
   const freeMachines = health?.freeMachines ?? 1;
   const maxMachines = health?.maxVmsPerUser ?? 3;
   const gpuSku = health?.gpuSku ?? 'NVIDIA GeForce RTX 4080 SUPER 16GB';
+  /** Five-tier catalog + its price range. Falls back to the hardcoded table
+   *  until the gateway ships `health.catalog`; when present, the wire wins. */
+  const catalog = readCatalog(health);
+  const range = catalogRange(catalog);
+  const fromPrice = range ? range.min : 1;
   /** See the dashboard note: guest names come from the gateway so that swapping
    *  a Proxmox template cannot leave this page advertising the wrong OS. */
   const winLabel = health?.windowsLabel || 'Windows';
@@ -1518,7 +1607,7 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
 
               <div className="mt-9 flex flex-wrap gap-3">
                 <button type="button" onClick={onLaunch} className={cx(BTN_PRIMARY, 'px-6 py-3.5 text-base')}>
-                  Get started — ${price}/hr <ArrowRight className="w-4 h-4" aria-hidden="true" />
+                  Get started — from ${fromPrice}/hr <ArrowRight className="w-4 h-4" aria-hidden="true" />
                 </button>
                 <a href="#pricing" className={cx(BTN_GHOST, 'px-6 py-3.5 text-base')}>See pricing</a>
               </div>
@@ -1561,7 +1650,7 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
         <section aria-label="At a glance" className="border-y border-white/10 bg-white/[0.015]">
           <div className="mx-auto grid max-w-6xl grid-cols-2 gap-6 px-5 py-8 text-center md:grid-cols-4">
             {[
-              [`$${price}`, 'per hour, per machine'],
+              [`from $${fromPrice}`, 'per hour — five tiers'],
               [`${freeMachines}`, `machine${freeMachines === 1 ? '' : 's'} free, always`],
               ['4080 SUPER', 'shared — live headroom shown'],
             ].map(([v, l]) => (
@@ -1594,26 +1683,24 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
         {/* ---- Hardware / products ---- */}
         <section id="hardware" className="mx-auto max-w-6xl px-5 py-20 md:py-28">
           <SectionHead
-            eyebrow="Three ways to compute"
-            title="One GPU, whichever interface you want"
-            sub="Every machine is a real isolated instance, not a queued batch job. The GPU is attached to the Ubuntu session; the Windows and Linux VMs are CPU and RAM only."
+            eyebrow="Five ways to compute"
+            title="One GPU, five tiers, whichever interface you want"
+            sub="Every machine is a real isolated instance, not a queued batch job. Only the GPU Session has the RTX 4080 attached — the others are CPU and RAM only. Prices are per hour, cheapest tier first."
           />
-          <div className="grid gap-5 md:grid-cols-3">
-            <FeatureCard
-              icon={<Terminal className="w-6 h-6" aria-hidden="true" />} accent="emerald"
-              name="Ubuntu GPU Session" tag="In-browser · noVNC"
-              desc="A full Ubuntu desktop streamed to your browser with the RTX 4080 attached. Nothing to install locally — open a tab and you have a workstation."
-            />
-            <FeatureCard
-              icon={<Laptop className="w-6 h-6" aria-hidden="true" />} accent="cyan"
-              name={winLabel} tag="RDP · full desktop"
-              desc={`A real ${winLabel} VM over RDP with administrator access. GUI applications and general compute on a genuine desktop — CPU and RAM only, no GPU attached.`}
-            />
-            <FeatureCard
-              icon={<Server className="w-6 h-6" aria-hidden="true" />} accent="violet"
-              name="Linux" tag="SSH · headless"
-              desc="Debian 12 over SSH with root. Docker and long-lived server jobs, without a desktop in the way. CPU and RAM only — for GPU work use the Ubuntu session."
-            />
+          <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+            {catalog.map((card) => (
+              <React.Fragment key={card.tier}>
+                <FeatureCard
+                  icon={TIER_ICON[card.iconKey]}
+                  accent={card.accent}
+                  name={card.label}
+                  tag={connectTag(card.connectVia)}
+                  price={card.priceUsdPerHour}
+                  gpuAttached={card.gpuAttached}
+                  desc={card.blurb}
+                />
+              </React.Fragment>
+            ))}
           </div>
 
           <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -1636,41 +1723,41 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
           <div className="mx-auto max-w-6xl px-5 py-20 md:py-28">
             <SectionHead
               eyebrow="Pricing"
-              title="One price. No subscription."
-              sub={`$${price} per hour per billed machine, charged by the minute. Your first ${freeMachines} concurrent machine${freeMachines === 1 ? '' : 's'} cost${freeMachines === 1 ? 's' : ''} nothing.`}
+              title="Pay per hour, per tier. No subscription."
+              sub={`Five tiers, ${range && range.min !== range.max ? `from $${range.min} to $${range.max}` : `from $${fromPrice}`} per hour, charged by the minute. Your first ${freeMachines} concurrent machine${freeMachines === 1 ? '' : 's'} cost${freeMachines === 1 ? 's' : ''} nothing.`}
             />
-            <div className="mx-auto grid max-w-4xl gap-5 md:grid-cols-3">
-              {[
-                { usd: 1, label: 'Try it', desc: 'Enough for a quick render or a model test.', featured: false },
-                { usd: 5, label: 'A session', desc: 'The usual top-up for an afternoon of work.', featured: true },
-                { usd: 24, label: 'A full day', desc: 'Long training runs and overnight jobs.', featured: false },
-              ].map((t) => (
-                <div
-                  key={t.usd}
+            <ul className="mx-auto grid max-w-4xl list-none gap-3 p-0">
+              {catalog.map((card) => (
+                <li
+                  key={card.tier}
                   className={cx(
-                    'surface relative flex flex-col rounded-2xl p-7 text-center',
-                    t.featured && 'border-cyan-400/40 shadow-[0_24px_60px_-40px_rgba(34,211,238,0.9)]',
+                    'surface flex flex-wrap items-center gap-x-4 gap-y-2 rounded-2xl p-5',
+                    ACCENTS[card.accent].ring,
                   )}
                 >
-                  {t.featured && (
-                    <span className="absolute -top-2.5 left-1/2 -translate-x-1/2 rounded-full bg-cyan-400 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-ink-950">
-                      Most common
-                    </span>
-                  )}
-                  <div className="text-sm font-semibold text-zinc-400">{t.label}</div>
-                  <div className="my-3 font-mono text-4xl font-black text-zinc-50">${t.usd}</div>
-                  <div className="font-mono text-xs text-cyan-300">
-                    = {Math.round((t.usd / price) * 60)} minutes
+                  <span className={cx('flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-white/10 bg-white/5', ACCENTS[card.accent].text)}>
+                    {TIER_ICON[card.iconKey]}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="font-semibold text-zinc-100">{card.label}</h3>
+                      <GpuBadge attached={card.gpuAttached} />
+                    </div>
+                    <p className={cx('text-[11px] font-medium uppercase tracking-wider', ACCENTS[card.accent].text)}>{connectTag(card.connectVia)}</p>
                   </div>
-                  <p className="mt-4 mb-7 flex-1 text-xs leading-relaxed text-zinc-500">{t.desc}</p>
-                  <button type="button" onClick={onLaunch} className={cx(t.featured ? BTN_PRIMARY : BTN_GHOST, 'mt-auto w-full py-3 text-sm')}>
-                    Get started
-                  </button>
-                </div>
+                  <div className="ml-auto text-right font-mono text-2xl font-black text-zinc-50">
+                    ${card.priceUsdPerHour}<span className="text-sm text-zinc-600">/hr</span>
+                  </div>
+                </li>
               ))}
+            </ul>
+            <div className="mt-8 flex justify-center">
+              <button type="button" onClick={onLaunch} className={cx(BTN_PRIMARY, 'px-8 py-3 text-sm')}>
+                Get started <ArrowRight className="w-4 h-4" aria-hidden="true" />
+              </button>
             </div>
-            <p className="mt-8 text-center text-xs text-zinc-600">
-              Balance is spent one minute per billed machine per minute. At zero, machines stop automatically —
+            <p className="mt-6 text-center text-xs text-zinc-600">
+              Balance is spent by the minute while a billed machine runs. At zero, machines stop automatically —
               you can never overdraw. Up to {maxMachines} concurrent machines per account.
             </p>
           </div>
@@ -1750,7 +1837,7 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
         <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-5 py-10 md:flex-row">
           <Logo />
           <p className="text-center text-xs text-zinc-600">
-            ${price}/hr · Bitcoin via BTCPay · No KYC ·{' '}
+            from ${fromPrice}/hr · Bitcoin via BTCPay · No KYC ·{' '}
             <a href="https://buymeacoffee.com/r26xrthzttg" target="_blank" rel="noopener noreferrer" className="text-zinc-500 underline-offset-2 hover:text-zinc-300 hover:underline">
               Support the build
             </a>
@@ -1816,19 +1903,30 @@ function SectionHead({ eyebrow, title, sub }: { eyebrow: string; title: string; 
 }
 
 function FeatureCard({
-  icon, name, tag, desc, accent,
+  icon, name, tag, desc, accent, price, gpuAttached,
 }: {
   icon: React.ReactNode; name: string; tag: string; desc: string; accent: keyof typeof ACCENTS;
+  /** Per-hour price from the catalog. Optional so non-tier uses stay unchanged. */
+  price?: number;
+  gpuAttached?: boolean;
 }) {
   const a = ACCENTS[accent];
   return (
-    <div className={cx('surface surface-hover rounded-2xl p-6', a.ring)}>
-      <div className={cx('mb-4 flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-white/5', a.text)}>
-        {icon}
+    <div className={cx('surface surface-hover flex flex-col rounded-2xl p-6', a.ring)}>
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <span className={cx('flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-white/5', a.text)}>
+          {icon}
+        </span>
+        {price != null && (
+          <span className="font-mono text-2xl font-bold leading-none text-zinc-100">
+            ${price}<span className="text-sm text-zinc-600">/hr</span>
+          </span>
+        )}
       </div>
       <h3 className="font-semibold text-zinc-100">{name}</h3>
       <p className={cx('mt-0.5 text-[11px] font-medium uppercase tracking-wider', a.text)}>{tag}</p>
-      <p className="mt-3 text-sm leading-relaxed text-zinc-400">{desc}</p>
+      <p className="mt-3 flex-1 text-sm leading-relaxed text-zinc-400">{desc}</p>
+      {gpuAttached != null && <GpuBadge attached={gpuAttached} />}
     </div>
   );
 }
