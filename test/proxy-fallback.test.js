@@ -426,7 +426,13 @@ describe("the tier is operator-only: tenants and anonymous callers never see it"
     assert.ok(!r.text.includes(HOME_IP));
     assert.ok(!r.text.includes(t2Clean.url));
     assert.ok(!r.text.includes(LIST_BASE), "the fallback source must not be public either");
-    assert.ok(!/tier|fallback/i.test(r.text), "no tier signal on the anonymous endpoint");
+    // The pricing catalog legitimately carries a `tier` key per entry (five-tier
+    // storefront). The anonymity invariant is about the PROXY tier, so check
+    // everything except the pricing catalog for a tier/fallback signal.
+    const { catalog, ...rest } = r.json;
+    assert.ok(!/tier|fallback/i.test(JSON.stringify(rest)), "no proxy-tier signal on the anonymous endpoint");
+    assert.ok(Array.isArray(catalog) && catalog.every((t) => typeof t.priceUsdPerHour === "number"),
+      "the only `tier` on /api/health is the pricing catalog");
     assert.equal(typeof r.json.cleanExitsAvailable, "number");
   });
 
