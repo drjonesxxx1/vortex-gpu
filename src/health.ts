@@ -28,6 +28,11 @@ export interface Health {
   gpuVramFreeMb?: number;
   gpuVramTotalMb?: number;
   minFreeVramMb?: number;
+  /** The five-tier product catalog: `{ tier, label, priceUsdPerHour, kind }`.
+   *  Optional so an older gateway degrades to a hardcoded fallback (see
+   *  ./catalog) rather than showing an empty storefront. When present it is the
+   *  source of truth for every tier's label and price. */
+  catalog?: Array<{ tier: string; label: string; priceUsdPerHour: number; kind: 'pct' | 'qm' | 'gpu' }>;
 }
 
 /** MiB is the unit the gateway speaks, so every hard number stays MiB. Only the
