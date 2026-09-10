@@ -2,13 +2,13 @@ import React, { Suspense, lazy, useCallback, useEffect, useId, useMemo, useRef, 
 import { createPortal } from 'react-dom';
 import {
   Activity, ArrowRight, Bitcoin, BookOpen, CheckCircle2, ChevronRight, Clock,
-  Cpu, ExternalLink, Eye, EyeOff, Globe, Laptop, Lock,
+  Cpu, ExternalLink, Eye, EyeOff, Gauge, Globe, Hourglass, Laptop, Lock,
   LogIn, LogOut, Menu, Monitor, Plug, Power, Rocket, Server, Settings as SettingsIcon,
-  Shield, Terminal, Trash2, UserPlus, Wallet, X, Zap,
+  Shield, Terminal, Thermometer, Trash2, UserPlus, Wallet, X, Zap,
 } from 'lucide-react';
 import {
   ACCENTS, Alert, BTN_AMBER, BTN_BASE, BTN_GHOST, BTN_PRIMARY, ConfirmDialog, CopyField,
-  INPUT_CLS, Spinner, StateBadge, cx, fmtBalance, readError, useDialogChrome,
+  GpuMeter, INPUT_CLS, Spinner, StateBadge, cx, fmtBalance, readError, useDialogChrome,
 } from './components/ui';
 import { SettingsView } from './components/SettingsView';
 import { GuideView } from './components/GuideView';
@@ -16,6 +16,10 @@ import { vmEndpoint } from './connect';
 import {
   type Capacity, type Health, fmtVram, readCapacity, useHealth,
 } from './health';
+import {
+  type GpuDeploy, type GpuStatus, type GpuStatusWire,
+  fmtCountdown, fmtGb, queueLabel, readGpuDeploy, readGpuStatus, remainingSeconds,
+} from './gpu';
 import {
   type TierCard, catalogRange, readCatalog, resolveRowTier,
 } from './catalog';
@@ -67,6 +71,12 @@ interface ApiVm extends TieredRow {
 interface ApiSession extends TieredRow {
   id: string; instance_id: string; node_hostname: string; port: number;
   password: string; resolution: string; proxy: string | null; state: string; created_at: number;
+  /** Present only on a `state:'queued'` row (see the contract). All optional —
+   *  an older gateway omits them and the queued card degrades to global status
+   *  or "time unknown" rather than inventing a position or an ETA. */
+  etaSeconds?: number | null;
+  queueDepth?: number | null;
+  holder?: string | null;
 }
 
 interface User { id: string; username: string; balance_minutes: number; unlimited?: boolean }
@@ -197,6 +207,11 @@ function Dashboard({
     freeMachines: 1,
   });
   const [health, setHealth] = useState<Health | null>(null);
+  /** Raw `/api/gpu-status`, normalised through readGpuStatus on render. */
+  const [gpuRaw, setGpuRaw] = useState<GpuStatusWire | null>(null);
+  /** When the last poll's status/session data landed — the anchor every
+   *  countdown ticks down from, re-synced on each refresh. */
+  const [dataTs, setDataTs] = useState(() => Date.now());
   const [loaded, setLoaded] = useState(false);
   const [connectionLost, setConnectionLost] = useState(false);
   const [error, setError] = useState('');
@@ -223,6 +238,13 @@ function Dashboard({
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => { if (d) setHealth(d as Health); })
       .catch(() => { /* capacity falls back to "unknown" */ });
+    // Live GPU status rides the same poll — no second timer. A missing endpoint
+    // (older gateway) or any failure leaves gpuRaw null, which normalises to
+    // source 'unknown' and the UI falls back to the health VRAM preflight.
+    const gpuReq = fetch('/api/gpu-status')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { setGpuRaw((d && typeof d === 'object') ? (d as GpuStatusWire) : null); })
+      .catch(() => { setGpuRaw(null); });
     try {
       const r = await fetch('/api/me', { headers: { Authorization: `Bearer ${token}` } });
       if (r.status === 401) {
@@ -233,6 +255,9 @@ function Dashboard({
       const d = await r.json();
       setVms(d.vms || []);
       setSessions(d.sessions || []);
+      // Re-sync the countdown anchor to this poll: queued ETAs tick down locally
+      // from here until the next poll corrects them.
+      setDataTs(Date.now());
       setMeta({
         gpuSku: d.gpu_sku || 'GPU',
         price: d.price_per_hour ?? 1,
@@ -245,7 +270,7 @@ function Dashboard({
     } catch {
       setConnectionLost(true);
     } finally {
-      await healthReq;
+      await Promise.all([healthReq, gpuReq]);
     }
   }, [token, setAuth]);
 
@@ -360,7 +385,21 @@ function Dashboard({
   /** Ubuntu sessions are the only product the VRAM preflight guards, so the
    *  Windows/Linux VM cards keep the account-level `blocked` rule alone. */
   const capacity = readCapacity(health);
-  const sessionBlocked = blocked ?? capacity.sessionBlocked;
+  /** Live HyperSwap status, and how the GPU deploy control should behave. */
+  const gpu = useMemo(() => readGpuStatus(gpuRaw), [gpuRaw]);
+  const gpuDeploy = useMemo(() => readGpuDeploy(gpu), [gpu]);
+  /**
+   * What blocks the GPU session button, reconciled across two sources:
+   *  - account rules (`blocked`: at cap / needs balance) always win — deploying
+   *    is impossible regardless of the card.
+   *  - when live status says the GPU is busy but reachable, the button is NOT
+   *    blocked: the backend queues the spawn, so the card switches to "join the
+   *    queue" (see gpuDeploy.mode === 'queue') rather than dead-ending.
+   *  - when live status is unknown (endpoint/field absent), fall back to the
+   *    /api/health VRAM preflight so a genuine "node offline" still blocks.
+   */
+  const sessionBlocked =
+    blocked ?? (gpuDeploy.mode === 'unknown' ? capacity.sessionBlocked : null);
   /** Guest names come from the gateway, which derives them from the templates
    *  actually configured. Hardcoding a version here means swapping a template
    *  silently leaves the storefront advertising an OS tenants do not get. */
@@ -551,7 +590,7 @@ function Dashboard({
             </p>
           </div>
 
-          <GpuCapacityCard capacity={capacity} gpuSku={meta.gpuSku} />
+          <GpuCapacityCard capacity={capacity} gpu={gpu} gpuSku={meta.gpuSku} />
         </section>
 
         {/* ---- Deploy ---- */}
@@ -566,7 +605,12 @@ function Dashboard({
             {catalog.map((card) => {
               /* The GPU tier is the only one the VRAM preflight gates; every
                  other tier answers to the account-level block alone. */
-              const cardBlocked = card.provision === 'session' ? sessionBlocked : blocked;
+              const isGpu = card.provision === 'session';
+              const cardBlocked = isGpu ? sessionBlocked : blocked;
+              /* The GPU card gets the live status strip and, when the card is
+                 busy but reachable, the "join the queue" behaviour. The account
+                 block still wins — no queue button if you cannot deploy at all. */
+              const queue = isGpu && !cardBlocked ? gpuDeploy : null;
               return (
                 <React.Fragment key={card.tier}>
                   <ProductCard
@@ -576,6 +620,10 @@ function Dashboard({
                     disabled={!!busy || !!cardBlocked}
                     blockedReason={cardBlocked}
                     onBlockedAction={needsBalance && !atCap ? () => setPayOpen(true) : undefined}
+                    gpu={isGpu ? gpu : null}
+                    queue={queue}
+                    syncedAt={dataTs}
+                    now={nowTs}
                   />
                 </React.Fragment>
               );
@@ -636,6 +684,8 @@ function Dashboard({
                     s={s}
                     gpuSku={meta.gpuSku}
                     tierInfo={resolveRowTier(s, catalog)}
+                    gpu={gpu}
+                    syncedAt={dataTs}
                     now={nowTs}
                     busy={busy === `d:${s.id}`}
                     deleting={busy === `x:${s.id}`}
@@ -708,7 +758,96 @@ function Dashboard({
  * the *state* changes, is announced, otherwise assistive tech would read a new
  * megabyte count every four seconds.
  */
-function GpuCapacityCard({ capacity, gpuSku }: { capacity: Capacity; gpuSku: string }) {
+function GpuCapacityCard({ capacity, gpu, gpuSku }: { capacity: Capacity; gpu: GpuStatus; gpuSku: string }) {
+  // When HyperSwap reports in, prefer its live meter. When it is down, say so
+  // honestly. When the endpoint is absent entirely, fall back to the /api/health
+  // VRAM preflight card exactly as before — never a fabricated reading.
+  if (gpu.known) return <GpuLiveCard gpu={gpu} gpuSku={gpuSku} />;
+  if (gpu.source === 'unavailable') return <GpuUnavailableCard capacity={capacity} gpuSku={gpuSku} />;
+  return <GpuCapacityFallbackCard capacity={capacity} gpuSku={gpuSku} />;
+}
+
+/** The rich card, driven by real HyperSwap numbers. busyPct -> meter,
+ *  vramFree/Used -> figures, tempC -> figure, holder -> "who has the card". Any
+ *  field the wire omitted renders "unknown", never a placeholder number. */
+function GpuLiveCard({ gpu, gpuSku }: { gpu: GpuStatus; gpuSku: string }) {
+  const { busyPct, vramFreeGb, vramUsedGb, vramTotalGb, tempC, holder, activeJob } = gpu;
+  // Coarse word for the live region: only changes when the state does.
+  const busyWord =
+    busyPct == null ? 'GPU utilisation unknown'
+      : busyPct >= 90 ? 'GPU under heavy load'
+        : busyPct >= 40 ? 'GPU busy'
+          : 'GPU mostly idle';
+  const holderLine = holder
+    ? `${holder} is using the GPU`
+    : (busyPct != null && busyPct < 10 ? 'No workload holds the card right now' : null);
+  return (
+    <div className="surface rounded-2xl p-5">
+      <div className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-zinc-500">
+        <Gauge className="w-3.5 h-3.5" aria-hidden="true" /> GPU load
+      </div>
+      <div className="mt-2 flex items-baseline gap-1 font-mono text-3xl font-bold leading-none text-cyan-300">
+        {busyPct == null ? '—' : `${Math.round(busyPct)}%`}
+        <span className="text-lg text-zinc-600">busy</span>
+      </div>
+      <div className="mt-3">
+        <GpuMeter pct={busyPct} label="GPU utilisation" />
+      </div>
+
+      <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 text-[11px]">
+        <div>
+          <dt className="text-zinc-500">VRAM free</dt>
+          <dd className="font-mono text-zinc-200">{fmtGb(vramFreeGb)}</dd>
+        </div>
+        <div>
+          <dt className="text-zinc-500">VRAM used</dt>
+          <dd className="font-mono text-zinc-200">
+            {fmtGb(vramUsedGb)}{vramTotalGb != null && <span className="text-zinc-600"> / {fmtGb(vramTotalGb)}</span>}
+          </dd>
+        </div>
+        <div>
+          <dt className="flex items-center gap-1 text-zinc-500"><Thermometer className="w-3 h-3" aria-hidden="true" /> Temp</dt>
+          <dd className="font-mono text-zinc-200">{tempC == null ? 'unknown' : `${Math.round(tempC)}°C`}</dd>
+        </div>
+        {activeJob && (
+          <div className="min-w-0">
+            <dt className="text-zinc-500">Model</dt>
+            <dd className="truncate font-mono text-zinc-200" title={activeJob.model}>{activeJob.model}</dd>
+          </div>
+        )}
+      </dl>
+
+      {/* Coarse word only — announced. The moving % lives outside any live
+          region so it is not re-read every four-second poll. */}
+      <p className="mt-3 text-xs leading-relaxed text-zinc-400">
+        <span className="sr-only" aria-live="polite">{busyWord}. </span>
+        {holderLine ?? busyWord}
+      </p>
+      <p className="mt-1 truncate text-[11px] text-zinc-600" title={gpuSku}>{gpuSku} · shared with HyperSwap</p>
+    </div>
+  );
+}
+
+/** HyperSwap is down: no numbers to trust, so we say exactly that and lean on
+ *  the /api/health node/VRAM copy for whatever is still known. */
+function GpuUnavailableCard({ capacity, gpuSku }: { capacity: Capacity; gpuSku: string }) {
+  return (
+    <div className="surface rounded-2xl p-5">
+      <div className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-zinc-500">
+        <Gauge className="w-3.5 h-3.5" aria-hidden="true" /> GPU load
+      </div>
+      <div className="mt-2 font-mono text-2xl font-bold leading-none text-zinc-400">unavailable</div>
+      <p className="mt-3 text-xs leading-relaxed text-zinc-500" aria-live="polite">
+        GPU status unavailable — the telemetry feed is not reporting in. {capacity.detail}
+      </p>
+      <p className="mt-1 truncate text-[11px] text-zinc-600" title={gpuSku}>{gpuSku}</p>
+    </div>
+  );
+}
+
+/** The original /api/health VRAM-preflight card, used when the gpu-status
+ *  endpoint is absent entirely (older gateway). Unchanged behaviour. */
+function GpuCapacityFallbackCard({ capacity, gpuSku }: { capacity: Capacity; gpuSku: string }) {
   const { state, freeMb, totalMb, minMb, detail } = capacity;
   const tone =
     state === 'ready' ? 'text-emerald-300'
@@ -784,24 +923,75 @@ function GpuBadge({ attached }: { attached: boolean }) {
   );
 }
 
+/**
+ * The live GPU status strip on the GPU-session tier card: a real utilisation
+ * meter plus who holds the card. Only rendered when HyperSwap actually reported
+ * (`gpu.known`); when its feed is down it says so instead of showing a meter at
+ * zero. The moving % is never inside a live region.
+ */
+function GpuSessionStrip({ gpu }: { gpu: GpuStatus }) {
+  if (gpu.source === 'unavailable') {
+    return (
+      <p className="mt-3 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-[11px] text-zinc-400">
+        Live GPU status unavailable right now.
+      </p>
+    );
+  }
+  if (!gpu.known) return null;
+  const holderLine = gpu.holder
+    ? `${gpu.holder} is using the GPU`
+    : (gpu.busyPct != null && gpu.busyPct < 10 ? 'Card is idle right now' : 'Shared with HyperSwap');
+  return (
+    <div className="mt-3 rounded-lg border border-white/10 bg-black/30 px-3 py-2.5">
+      <div className="flex items-center justify-between gap-2 text-[10px] uppercase tracking-wider text-zinc-500">
+        <span>GPU load</span>
+        {gpu.tempC != null && <span className="font-mono normal-case tracking-normal text-zinc-400">{Math.round(gpu.tempC)}°C</span>}
+      </div>
+      <div className="mt-1.5"><GpuMeter pct={gpu.busyPct} label="GPU utilisation" /></div>
+      <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-zinc-400">
+        <Cpu className="h-3 w-3 shrink-0" aria-hidden="true" /> {holderLine}
+        {gpu.vramFreeGb != null && <span className="text-zinc-600">· {fmtGb(gpu.vramFreeGb)} free</span>}
+      </p>
+    </div>
+  );
+}
+
 function ProductCard({
-  card, onClick, busy, disabled, blockedReason, onBlockedAction,
+  card, onClick, busy, disabled, blockedReason, onBlockedAction, gpu, queue, syncedAt = 0, now = 0,
 }: {
   card: TierCard;
   onClick: () => void;
   busy: boolean; disabled: boolean; blockedReason: string | null;
   onBlockedAction?: () => void;
+  /** Live status for the GPU tier card; null on every other tier. */
+  gpu?: GpuStatus | null;
+  /** How the deploy control should behave when the GPU is reachable but busy;
+   *  null when there is no queue behaviour (not the GPU tier, or blocked). */
+  queue?: GpuDeploy | null;
+  /** Countdown anchor + live clock — the ETA ticks down from `syncedAt`. */
+  syncedAt?: number; now?: number;
 }) {
   const a = ACCENTS[card.accent];
-  const cta = card.provision === 'session' ? 'Spawn session' : 'Deploy';
   const showTopUp = !!blockedReason && !!onBlockedAction;
   /** A blocked control has to say why in a way a keyboard or screen-reader user
    *  can actually reach. A natively `disabled` button drops out of the tab order
    *  and takes its own description with it, so it is marked aria-disabled
    *  instead: still focusable, still announced, but inert on click. */
   const whyId = `why-${useId()}`;
+  const announceId = `queue-${useId()}`;
   const showWhy = !!blockedReason && !showTopUp;
   const inert = disabled || busy;
+
+  // "Join the queue" mode: the GPU is busy but reachable, so deploying is still
+  // allowed — the backend queues it. The button is honest about the wait rather
+  // than dead-ending on "GPU busy".
+  const isQueue = queue?.mode === 'queue';
+  const rem = isQueue ? remainingSeconds(queue!.etaSeconds, syncedAt, now) : null;
+  const etaKnown = rem != null;
+  const ql = queueLabel(queue?.queueDepth ?? null);
+  const cta = isQueue ? 'Join the queue'
+    : card.provision === 'session' ? 'Spawn session' : 'Deploy';
+
   return (
     <div className={cx('surface surface-hover flex flex-col rounded-2xl p-5', a.ring)}>
       <div className="mb-3 flex items-start justify-between gap-3">
@@ -817,6 +1007,8 @@ function ProductCard({
       <p className="mt-3 flex-1 text-sm leading-relaxed text-zinc-400">{card.blurb}</p>
       <GpuBadge attached={card.gpuAttached} />
 
+      {gpu && <GpuSessionStrip gpu={gpu} />}
+
       {showTopUp ? (
         <button type="button" onClick={onBlockedAction} className={cx(BTN_AMBER, 'mt-5 w-full py-3 text-sm')}>
           <Bitcoin className="w-4 h-4" aria-hidden="true" /> {blockedReason}
@@ -827,17 +1019,35 @@ function ProductCard({
           onClick={() => { if (!inert) onClick(); }}
           aria-disabled={inert}
           aria-busy={busy}
-          aria-describedby={showWhy ? whyId : undefined}
+          aria-describedby={showWhy ? whyId : (isQueue ? announceId : undefined)}
           title={blockedReason ?? undefined}
           className={cx(
-            BTN_BASE, a.btn, 'mt-5 w-full py-3 text-sm',
+            BTN_BASE, isQueue ? BTN_AMBER : a.btn, 'mt-5 w-full py-3 text-sm',
             // pointer-events-none also kills the accent hover state, which would
             // otherwise light up an inert button. Focus is unaffected.
             'aria-disabled:pointer-events-none aria-disabled:opacity-45',
           )}
         >
-          {busy ? <><Spinner /> Starting…</> : <>{cta} <ArrowRight className="w-4 h-4" aria-hidden="true" /></>}
+          {busy ? <><Spinner /> Starting…</>
+            : isQueue ? <><Hourglass className="w-4 h-4" aria-hidden="true" /> {cta}</>
+              : <>{cta} <ArrowRight className="w-4 h-4" aria-hidden="true" /></>}
         </button>
+      )}
+
+      {isQueue && !showWhy && (
+        <>
+          {/* The countdown itself is NOT announced — it changes every second.
+              Only the coarse "busy / queue" sentence is, and only when the mode
+              changes. */}
+          <p className="mt-2 text-center text-[11px] leading-relaxed text-amber-300">
+            {etaKnown
+              ? <>Starts in ~<span className="font-mono tabular-nums">{fmtCountdown(rem)}</span></>
+              : 'waiting — time unknown'}
+            {ql && <span className="text-zinc-500"> · {ql}</span>}
+          </p>
+          <p className="mt-1 text-center text-[11px] text-zinc-600">Nothing is charged while you wait in the queue.</p>
+          <span id={announceId} className="sr-only" aria-live="polite">{queue!.announce}</span>
+        </>
       )}
 
       {showWhy && (
@@ -848,20 +1058,36 @@ function ProductCard({
 }
 
 function SessionCard({
-  s, gpuSku, tierInfo, now, busy, deleting, disabled, onStop, onDelete,
+  s, gpuSku, tierInfo, gpu, syncedAt, now, busy, deleting, disabled, onStop, onDelete,
 }: {
   s: ApiSession; gpuSku: string;
   /** Tier label + per-hour price from the row, or null when the gateway has not
    *  tagged it — the card then keeps its generic name and shows no price. */
   tierInfo: { label: string; price: number | null } | null;
+  /** Live status, used only to fill a queued card's position/holder/ETA when
+   *  the session row itself did not carry them. */
+  gpu: GpuStatus;
+  /** Countdown anchor (last poll) — the queued ETA ticks down from here. */
+  syncedAt: number;
   now: number; busy: boolean; deleting: boolean;
   disabled: boolean; onStop: () => void; onDelete: () => void;
 }) {
   const isRunning = s.state === 'running';
   const isProvisioning = s.state === 'provisioning';
-  const isActive = isRunning || isProvisioning;
+  /** A distinct state: the spawn was accepted but is waiting for the card. The
+   *  backend charges nothing until it promotes to `running`. */
+  const isQueued = s.state === 'queued';
+  const isActive = isRunning || isProvisioning || isQueued;
   /** The server refuses to delete anything still running. */
   const removable = s.state === 'stopped' || s.state === 'failed';
+
+  // Queued figures: prefer the row's own, fall back to the global live status,
+  // and never invent one — a missing ETA shows "time unknown".
+  const qEta = s.etaSeconds ?? gpu.etaSeconds ?? null;
+  const qRem = isQueued ? remainingSeconds(qEta, syncedAt, now) : null;
+  const qDepth = s.queueDepth ?? gpu.queueDepth ?? null;
+  const qHolder = s.holder ?? gpu.holder ?? null;
+  const qLabel = queueLabel(qDepth);
 
   return (
     <article
@@ -869,6 +1095,7 @@ function SessionCard({
         'surface flex h-full flex-col rounded-2xl p-5',
         isRunning && 'border-emerald-400/35 shadow-[0_20px_50px_-30px_rgba(16,185,129,0.7)]',
         isProvisioning && 'border-amber-400/30',
+        isQueued && 'border-cyan-400/30',
       )}
     >
       <header className="flex items-start justify-between gap-3">
@@ -904,6 +1131,25 @@ function SessionCard({
         </div>
       </dl>
 
+      {isQueued && (
+        <div className="mt-4 rounded-lg border border-cyan-400/25 bg-cyan-400/5 px-3 py-2.5 text-xs text-cyan-100">
+          <p className="flex items-center gap-2 font-semibold">
+            <Hourglass className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            {qRem != null
+              ? <>Queued — starting in ~<span className="font-mono tabular-nums">{fmtCountdown(qRem)}</span></>
+              : <>Queued — start time unknown</>}
+          </p>
+          <p className="mt-1 text-[11px] text-cyan-200/80">
+            {qLabel ? `${qLabel[0].toUpperCase()}${qLabel.slice(1)}` : 'Waiting for the card'}
+            {qHolder && <span className="text-cyan-200/60"> · {qHolder} holds it now</span>}
+          </p>
+          <p className="mt-1 text-[11px] text-zinc-400">Nothing is charged while queued — billing starts only when it goes live.</p>
+          {/* Coarse state only in the live region; the mm:ss above is not
+              announced, so it does not re-read every second. */}
+          <span className="sr-only" aria-live="polite">Session queued, waiting for the GPU.</span>
+        </div>
+      )}
+
       <div className="mt-auto pt-4">
         <div className="flex gap-2">
           {isRunning ? (
@@ -919,6 +1165,10 @@ function SessionCard({
             <span className={cx(BTN_BASE, 'flex-1 cursor-wait bg-white/5 py-2.5 text-sm text-zinc-300')} aria-live="polite">
               <Spinner className="w-4 h-4 text-amber-400" /> Booting desktop…
             </span>
+          ) : isQueued ? (
+            <span className={cx(BTN_BASE, 'flex-1 cursor-wait bg-white/5 py-2.5 text-sm text-cyan-200')}>
+              <Hourglass className="w-4 h-4 text-cyan-300" aria-hidden="true" /> Waiting for the GPU…
+            </span>
           ) : (
             <span className={cx(BTN_BASE, 'flex-1 bg-white/5 py-2.5 text-sm text-zinc-500')}>
               <Power className="w-4 h-4" aria-hidden="true" />{' '}
@@ -931,10 +1181,10 @@ function SessionCard({
               onClick={onStop}
               disabled={disabled}
               aria-busy={busy}
-              aria-label={`Stop session ${s.instance_id}`}
+              aria-label={isQueued ? `Leave the queue for session ${s.instance_id}` : `Stop session ${s.instance_id}`}
               className={cx(BTN_BASE, 'border border-red-500/40 px-4 py-2.5 text-xs text-red-300 hover:bg-red-500/10')}
             >
-              {busy ? <Spinner className="w-3.5 h-3.5" /> : <Power className="w-3.5 h-3.5" aria-hidden="true" />} Stop
+              {busy ? <Spinner className="w-3.5 h-3.5" /> : <Power className="w-3.5 h-3.5" aria-hidden="true" />} {isQueued ? 'Leave' : 'Stop'}
             </button>
           )}
           {removable && (
@@ -951,9 +1201,13 @@ function SessionCard({
             </button>
           )}
         </div>
-        <div className="mt-3">
-          <CopyField label="VNC password" value={s.password} secret />
-        </div>
+        {/* No VNC password until there is a running desktop to unlock — a queued
+            session has not been assigned one yet, so we do not show an empty field. */}
+        {!isQueued && s.password && (
+          <div className="mt-3">
+            <CopyField label="VNC password" value={s.password} secret />
+          </div>
+        )}
       </div>
     </article>
   );
@@ -1514,6 +1768,14 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
   const winLabel = health?.windowsLabel || 'Windows';
   const linLabel = health?.linuxLabel || 'Linux';
   const capacity = readCapacity(health);
+  /** Coarse public GPU load, REAL number only. Shown to logged-out visitors
+   *  when the gateway carries it and HyperSwap is reporting; hidden entirely
+   *  otherwise — never a resurrected fake "GPU LOAD: 74%". */
+  const gpuBusyPct =
+    typeof health?.gpuBusyPct === 'number' && Number.isFinite(health.gpuBusyPct)
+      ? Math.min(100, Math.max(0, health.gpuBusyPct))
+      : null;
+  const showGpuLoad = gpuBusyPct != null && health?.gpuStatus !== 'unavailable';
 
   return (
     <div className="min-h-screen bg-ink-950 text-zinc-100">
@@ -1589,7 +1851,10 @@ function LandingPage({ onLaunch, onGuide }: { onLaunch: () => void; onGuide: () 
           <div className="pointer-events-none absolute inset-0 bg-grid" aria-hidden="true" />
           <div className="relative mx-auto grid max-w-6xl items-center gap-12 px-5 py-16 md:py-24 lg:grid-cols-2">
             <div className="animate-rise">
-              <StatusPill capacity={capacity} />
+              <div className="flex flex-wrap items-center gap-2">
+                <StatusPill capacity={capacity} />
+                {showGpuLoad && <GpuLoadIndicator pct={gpuBusyPct as number} />}
+              </div>
 
               <h1 className="mt-6 text-display font-black">
                 Rent a real GPU PC,{' '}
@@ -1888,6 +2153,28 @@ function StatusPill({ capacity }: { capacity: Capacity }) {
           <span className="tracking-normal opacity-90">{capacity.figure}</span>
         </>
       )}
+    </span>
+  );
+}
+
+/**
+ * A small live "GPU load" pill for logged-out visitors, driven by the REAL
+ * coarse `gpuBusyPct` on /api/health. The caller only renders it when that
+ * number is present and HyperSwap is reporting, so this component always has a
+ * genuine reading — it never fabricates one. The meter carries the a11y
+ * semantics; the % is a text equivalent and is not in a live region (it moves
+ * on every 30s health poll).
+ */
+function GpuLoadIndicator({ pct }: { pct: number }) {
+  const v = Math.round(Math.min(100, Math.max(0, pct)));
+  return (
+    <span
+      className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-[11px] uppercase tracking-[0.14em] text-zinc-400"
+      title={`Live GPU load: ${v}% busy`}
+    >
+      <Gauge className="h-3.5 w-3.5 shrink-0 text-cyan-400" aria-hidden="true" />
+      GPU load
+      <span className="w-16"><GpuMeter pct={v} label="Live GPU load" /></span>
     </span>
   );
 }
