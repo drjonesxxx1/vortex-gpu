@@ -144,6 +144,18 @@ const MAX_INVOICE_CENTS = 1_000_000; // $10,000 ceiling on a single top-up
 // cannot run anything on the GPU — while still billing them. Refuse instead.
 // Set to 0 to disable the preflight.
 const MIN_FREE_VRAM_MB = Number.isFinite(Number(process.env.MIN_FREE_VRAM_MB)) ? Number(process.env.MIN_FREE_VRAM_MB) : 2048;
+// A paying GPU-session tenant should get the card even when the operator's own
+// ollama workload (HyperSwap) has a model resident. When a spawn is blocked on
+// VRAM and this is on (default), the gateway asks ollama to unload its resident
+// models, then waits for the node's telemetry to confirm the VRAM actually came
+// back before proceeding. ollama reloads the model on its next request, so this
+// preempts rather than kills. Set 0 to leave ollama untouched (spawn just 503s
+// when the card is full, the prior behaviour).
+const GPU_PREEMPT_OLLAMA = str(process.env.GPU_PREEMPT_OLLAMA, "1").trim() !== "0";
+// Where the session node's ollama listens. Empty = derive http://<node ip>:11434
+// from the node's own telemetry at spawn time.
+const OLLAMA_URL = str(process.env.OLLAMA_URL, "");
+const GPU_PREEMPT_WAIT_MS = Math.max(2000, num(process.env.GPU_PREEMPT_WAIT_MS, 12000));
 // The only node running the Linux docker/noVNC session agent. Health and spawn
 // MUST agree on this, or health advertises capacity sessions cannot use.
 const SESSION_NODE = process.env.SESSION_NODE || "nightmare";
@@ -1050,6 +1062,39 @@ function healthyTier1(): ProxyEndpoint[] { return proxyEndpoints.filter((e) => e
 function healthyTier2(): ProxyEndpoint[] { return PROXY_FALLBACK_ENABLED ? fallbackEndpoints.filter((e) => e.healthy) : []; }
 /** Every verified-clean exit, both tiers. */
 function healthyProxies(): ProxyEndpoint[] { return [...healthyTier1(), ...healthyTier2()]; }
+
+// Ask the session node's ollama to unload every resident model, freeing VRAM
+// for a paying GPU session. ollama reloads on its next request, so this preempts
+// the operator's own LLM workload rather than killing it. Best-effort: any error
+// is swallowed and the caller re-checks real telemetry to decide, so a failed
+// eviction just means the spawn still 503s on capacity — never a false "clear".
+async function evictOllamaModels(nodeIp: string): Promise<{ attempted: number }> {
+  const base = OLLAMA_URL || `http://${nodeIp}:11434`;
+  let attempted = 0;
+  try {
+    const ctl = AbortSignal.timeout(4000);
+    const ps = await fetch(`${base}/api/ps`, { signal: ctl }).then((r) => r.json()).catch(() => null);
+    const models: string[] = Array.isArray(ps?.models) ? ps.models.map((m: any) => m?.model || m?.name).filter(Boolean) : [];
+    for (const model of models) {
+      attempted++;
+      // keep_alive:0 unloads the model as soon as this (empty) request returns.
+      await fetch(`${base}/api/generate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model, keep_alive: 0 }),
+        signal: AbortSignal.timeout(6000),
+      }).catch(() => {});
+    }
+    if (attempted) console.log(`[gpu] preempt: asked ollama at ${base} to unload ${attempted} model(s) for a GPU session`);
+  } catch (e) {
+    console.warn(`[gpu] preempt: could not reach ollama at ${base}: ${String((e as Error)?.message || e).slice(0, 120)}`);
+  }
+  return { attempted };
+}
+
+// Free VRAM (MiB) the node currently reports. Reads live telemetry, which the
+// /api/node/report handler refreshes every few seconds.
+function nodeFreeVramMb(n: any): number { return Math.max(0, (n?.memTotalMb || 0) - (n?.memUsedMb || 0)); }
 /** Everything we know about, for the admin view. */
 function allProxyEndpoints(): ProxyEndpoint[] { return [...proxyEndpoints, ...(PROXY_FALLBACK_ENABLED ? fallbackEndpoints : [])]; }
 
@@ -1661,7 +1706,7 @@ async function startServer() {
   });
 
   // ===== UBUNTU GPU SESSIONS (spawn in-browser desktop with the 4080 attached) =====
-  app.post("/api/session/spawn", provisionLimit(), (req, res) => {
+  app.post("/api/session/spawn", provisionLimit(), async (req, res) => {
     const user = userFromReq(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
     // `resolution` is forwarded verbatim in the provision_ubuntu job payload and
@@ -1683,9 +1728,30 @@ async function startServer() {
       return res.status(503).json({ error: "GPU node offline — try again shortly" });
     }
     // Capacity preflight against real nvidia-smi telemetry from the node.
-    const freeVramMb = Math.max(0, (node.memTotalMb || 0) - (node.memUsedMb || 0));
+    let freeVramMb = nodeFreeVramMb(node);
     if (MIN_FREE_VRAM_MB > 0 && node.memTotalMb > 0 && freeVramMb < MIN_FREE_VRAM_MB) {
-      return res.status(503).json({ error: `GPU at capacity — ${freeVramMb} MiB VRAM free, ${MIN_FREE_VRAM_MB} MiB required. Nothing was charged; try again shortly.` });
+      // Try to preempt the operator's own ollama workload rather than refusing.
+      // Evict, then WAIT for the node's telemetry to actually reflect the freed
+      // VRAM — same source of truth as the check above, so we never proceed on a
+      // hopeful assumption. If it does not come back, fall through to the 503.
+      if (GPU_PREEMPT_OLLAMA && node.ip) {
+        const { attempted } = await evictOllamaModels(node.ip);
+        // Only wait on telemetry if we actually unloaded something; otherwise
+        // nothing will change and polling would just stall the request (and the
+        // tests) for no reason — the VRAM is held by something we cannot move.
+        if (attempted > 0) {
+          const deadline = Date.now() + GPU_PREEMPT_WAIT_MS;
+          while (Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 1500));
+            freeVramMb = nodeFreeVramMb(nodes[hostname]); // re-read: the report handler mutates this in the background
+            if (freeVramMb >= MIN_FREE_VRAM_MB) break;
+          }
+          if (freeVramMb >= MIN_FREE_VRAM_MB) console.log(`[gpu] preempt succeeded — ${freeVramMb} MiB free after eviction`);
+        }
+      }
+      if (freeVramMb < MIN_FREE_VRAM_MB) {
+        return res.status(503).json({ error: `GPU at capacity — ${freeVramMb} MiB VRAM free, ${MIN_FREE_VRAM_MB} MiB required. Nothing was charged; try again shortly.` });
+      }
     }
 
     // The /session/<instanceId>/ proxy is necessarily unauthenticated (noVNC
