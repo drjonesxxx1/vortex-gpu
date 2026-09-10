@@ -178,6 +178,44 @@ const BILLING_TICK_MS = Math.max(1000, num(process.env.BILLING_TICK_MS, 60_000))
 // Marketing tier label (what tenants see) — configurable, decoupled from truth.
 const GPU_SKU = process.env.GPU_SKU || "NVIDIA GeForce RTX 4080 SUPER 16GB";
 
+// ---- HyperSwap (live GPU arbitrator on the session node) ----
+// HyperSwap arbitrates the shared RTX 4080 SUPER between the operator's own
+// workloads (ollama, comfyui, stt-relay, desktop) and paying vortex sessions.
+// The gateway integrates against its read-only HTTP API only; it NEVER manages
+// HyperSwap and NEVER evicts an actively-running job. Base URL is derived from
+// the session node's telemetry IP (http://<ip>:9090) unless HYPERSWAP_URL
+// overrides it. Every field HyperSwap returns is treated as optional — if a
+// number is missing we report it as null/unknown and never fabricate one.
+const HYPERSWAP_URL = str(process.env.HYPERSWAP_URL, "");
+const HYPERSWAP_PORT = num(process.env.HYPERSWAP_PORT, 9090);
+// Short timeout so a slow/hung arbitrator never stalls a request path.
+const HYPERSWAP_TIMEOUT_MS = Math.max(500, num(process.env.HYPERSWAP_TIMEOUT_MS, 2500));
+// Cache the last derived reading briefly so repeated polls (health, spawn, the
+// promoter, /api/sessions) don't hammer HyperSwap.
+const HYPERSWAP_CACHE_MS = Math.max(0, num(process.env.HYPERSWAP_CACHE_MS, 2000));
+// vortex's own priority in HyperSwap's scheme. Tenants numerically higher than
+// this (stt-relay=70, desktop=90) outrank a session and must never be preempted.
+const VORTEX_PRIORITY = num(process.env.VORTEX_PRIORITY, 65);
+// MAY ask an IDLE reclaimable tenant (a parked ollama/comfy model with no
+// running job) to yield the card for a session — reclaiming idle residency, not
+// killing work. Never used against an active job. Default on.
+const HYPERSWAP_RECLAIM_IDLE = str(process.env.HYPERSWAP_RECLAIM_IDLE, "1").trim() === "1";
+// After a reclaim, wait up to this long for /api/gpu to confirm the VRAM came
+// back before proceeding — same source of truth, so we never act on assumption.
+const HYPERSWAP_RECLAIM_WAIT_MS = Math.max(0, num(process.env.HYPERSWAP_RECLAIM_WAIT_MS, 8000));
+
+// ---- GPU session queue (wait-your-turn instead of a blunt 503) ----
+// When the card is not available, a spawn is parked as a 'queued' session (no
+// charge, no container) and a background promoter dispatches it oldest-first
+// once the card frees. A queued session that is never granted expires to
+// 'failed' after GPU_QUEUE_TTL_MS. MAX_GPU_SESSIONS bounds how many sessions may
+// occupy the box at once (the operator's hard rule: never more than 5).
+// Floors are low so the promoter can be exercised quickly under test; the
+// PRODUCTION defaults (30min TTL, 5s sweep) are what run when unset.
+const GPU_QUEUE_TTL_MS = Math.max(1000, num(process.env.GPU_QUEUE_TTL_MS, 30 * 60_000));
+const MAX_GPU_SESSIONS = Math.max(1, num(process.env.MAX_GPU_SESSIONS, 5));
+const GPU_QUEUE_SWEEP_MS = Math.max(250, num(process.env.GPU_QUEUE_SWEEP_MS, 5000));
+
 // ---- GPU node registry (in-memory; agents phone home) ----
 type GpuNode = {
   hostname: string;
@@ -355,6 +393,11 @@ ensureColumn("vms", "tier", "tier TEXT");
 ensureColumn("vms", "price_usd_per_hour", "price_usd_per_hour REAL");
 ensureColumn("sessions", "tier", "tier TEXT");
 ensureColumn("sessions", "price_usd_per_hour", "price_usd_per_hour REAL");
+// A GPU session may be parked in 'queued' state while it waits its turn on the
+// shared card. status_reason records why a queued session was later failed
+// (e.g. it timed out before the card ever freed). Nullable — legacy rows and
+// non-queued rows leave it NULL.
+ensureColumn("sessions", "status_reason", "status_reason TEXT");
 
 function q(sql: string, ...p: (string | number)[]) { return db.prepare(sql).run(...p); }
 function one<T>(sql: string, ...p: (string | number)[]): T | undefined { return db.prepare(sql).get(...p) as T | undefined; }
@@ -1102,6 +1145,306 @@ async function evictOllamaModels(nodeIp: string): Promise<{ attempted: number }>
 // Free VRAM (MiB) the node currently reports. Reads live telemetry, which the
 // /api/node/report handler refreshes every few seconds.
 function nodeFreeVramMb(n: any): number { return Math.max(0, (n?.memTotalMb || 0) - (n?.memUsedMb || 0)); }
+
+// ============================================================================
+// HyperSwap client + derived GPU status
+// ----------------------------------------------------------------------------
+// All of this is READ-ONLY against HyperSwap's HTTP API except the explicit
+// idle-reclaim release, which is gated behind HYPERSWAP_RECLAIM_IDLE and only
+// ever aimed at an IDLE reclaimable tenant. Nothing here throws into a request
+// path: every failure degrades to source='unavailable'.
+// ============================================================================
+
+// Shape returned to callers. Numeric fields are `number | null` — null means
+// "HyperSwap did not report it", never a fabricated value.
+type GpuStatus = {
+  source: "hyperswap" | "unavailable";
+  busyPct: number | null;
+  vramUsedGb: number | null;
+  vramFreeGb: number | null;
+  vramTotalGb: number | null;
+  tempC: number | null;
+  holder: string | null;
+  activeJob: { model: string | null; elapsedS: number | null; etaS: number | null } | null;
+  queueDepth: number;
+  etaSeconds: number | null;
+  available: boolean;
+  // Internal hint for the spawn/promoter path: an idle reclaimable tenant that
+  // is holding VRAM and could be asked to yield. Not part of the public shape.
+  reclaimableIdleHolder?: string | null;
+};
+
+function unavailableStatus(): GpuStatus {
+  return { source: "unavailable", busyPct: null, vramUsedGb: null, vramFreeGb: null, vramTotalGb: null, tempC: null, holder: null, activeJob: null, queueDepth: 0, etaSeconds: null, available: false, reclaimableIdleHolder: null };
+}
+
+// Base URL: explicit override, else derived from the session node's telemetry IP.
+function hyperswapBase(): string | null {
+  if (HYPERSWAP_URL) return HYPERSWAP_URL.replace(/\/+$/, "");
+  const ip = nodes[SESSION_NODE]?.ip;
+  return ip ? `http://${ip}:${HYPERSWAP_PORT}` : null;
+}
+
+// One GET against HyperSwap. Returns the parsed JSON, or null on any error
+// (unreachable, timeout, non-2xx, bad JSON). Never throws.
+async function hyperswapGet(base: string, apiPath: string): Promise<any | null> {
+  try {
+    const r = await fetch(`${base}${apiPath}`, { signal: AbortSignal.timeout(HYPERSWAP_TIMEOUT_MS) });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+// POST /api/tenants/{name}/release — asks a tenant to yield its VRAM. Only ever
+// called for an IDLE reclaimable tenant (see resolveReclaimIdle). Best effort.
+async function hyperswapRelease(base: string, tenant: string): Promise<boolean> {
+  try {
+    const r = await fetch(`${base}/api/tenants/${encodeURIComponent(tenant)}/release`, { method: "POST", signal: AbortSignal.timeout(HYPERSWAP_TIMEOUT_MS) });
+    return r.ok;
+  } catch { return false; }
+}
+
+// Parse a HyperSwap timestamp to epoch-ms. Accepts unix seconds, unix ms, or an
+// ISO string. Returns NaN if unparseable (caller degrades to "unknown").
+function parseHsTime(v: unknown): number {
+  if (typeof v === "number" && Number.isFinite(v)) {
+    if (v > 1e12) return v;        // already ms
+    if (v > 1e9) return v * 1000;  // unix seconds
+    return NaN;
+  }
+  if (typeof v === "string" && v) { const t = Date.parse(v); return Number.isFinite(t) ? t : NaN; }
+  return NaN;
+}
+
+function median(nums: number[]): number | null {
+  const xs = nums.filter((n) => Number.isFinite(n) && n >= 0).sort((a, b) => a - b);
+  if (!xs.length) return null;
+  const mid = Math.floor(xs.length / 2);
+  return xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
+}
+
+// Median duration (seconds) of DONE jobs grouped by payload.model. Used for ETA.
+function medianDurationForModel(jobsArr: any[], model: string | null): number | null {
+  if (!model) return null;
+  const durs = jobsArr
+    .filter((j) => j && j.state === "done" && (j.payload?.model ?? null) === model && Number.isFinite(Number(j.duration_s)))
+    .map((j) => Number(j.duration_s));
+  return median(durs);
+}
+
+// A tenant is treated as ACTIVELY busy if HyperSwap flags a non-empty `busy`
+// object for it. Missing/empty => not busy (degrade safe: we do not invent work).
+function tenantBusy(t: any): boolean {
+  const b = t?.busy;
+  if (!b) return false;
+  if (typeof b === "object") return Object.keys(b).length > 0;
+  return !!b;
+}
+
+// Turn raw HyperSwap payloads into the derived status. `gpu` must be present for
+// source='hyperswap'; tenants/stats/jobs are optional and degrade if missing.
+function deriveGpuStatus(gpu: any, tenants: any, stats: any, jobsPayload: any): GpuStatus {
+  const numOrNull = (v: unknown): number | null => { const n = Number(v); return Number.isFinite(n) ? n : null; };
+
+  const tenantList: any[] = Array.isArray(tenants?.tenants) ? tenants.tenants : [];
+  const jobsArr: any[] = Array.isArray(jobsPayload?.jobs) ? jobsPayload.jobs : [];
+
+  // Holder = tenant holding the most VRAM (>0), else null.
+  let holder: string | null = null;
+  let holderGb = 0;
+  for (const t of tenantList) {
+    const g = Number(t?.holding_gb);
+    if (Number.isFinite(g) && g > holderGb) { holderGb = g; holder = str(t?.name, holder ?? "") || holder; }
+  }
+
+  // Running job on the card (earliest-started wins if HyperSwap reports several).
+  const running = jobsArr.filter((j) => j && j.state === "running")
+    .sort((a, b) => (parseHsTime(a.started_at) || 0) - (parseHsTime(b.started_at) || 0));
+  const now = Date.now();
+  let activeJob: GpuStatus["activeJob"] = null;
+  if (running.length) {
+    const j = running[0];
+    const model = str(j.payload?.model, "") || null;
+    const startMs = parseHsTime(j.started_at);
+    const elapsedS = Number.isFinite(startMs) ? Math.max(0, Math.round((now - startMs) / 1000)) : null;
+    const med = medianDurationForModel(jobsArr, model);
+    const etaS = med !== null && elapsedS !== null ? Math.max(0, Math.round(med - elapsedS)) : null;
+    activeJob = { model, elapsedS, etaS };
+  }
+
+  // Queue depth: queued+running jobs whose tenant is NOT vortex.
+  const queueDepth = jobsArr.filter((j) => j && (j.state === "queued" || j.state === "running") && str(j.tenant, "") !== "vortex").length;
+
+  // ---- Policy: wait your turn, do not evict active work ----
+  const hasRunningJob = running.length > 0;
+  const gpuBusyFlag = gpu?.available === false; // explicit "card not free" signal
+  // A tenant that outranks vortex and is busy OR is holding the card blocks us.
+  const higherPriorityBlock = tenantList.some((t) => num(t?.priority, 0) > VORTEX_PRIORITY && (tenantBusy(t) || Number(t?.holding_gb) > 0));
+
+  // An IDLE reclaimable tenant currently holding the card (a parked model, no
+  // running job of its own) — a candidate to reclaim to free the card.
+  const busyTenants = new Set(jobsArr.filter((j) => j && j.state === "running").map((j) => str(j.tenant, "")));
+  let reclaimableIdleHolder: string | null = null;
+  for (const t of tenantList) {
+    const name = str(t?.name, "");
+    if (!name) continue;
+    if (t?.reclaimable && Number(t?.holding_gb) > 0 && !busyTenants.has(name)) { reclaimableIdleHolder = name; break; }
+  }
+
+  const blocked = hasRunningJob || gpuBusyFlag || higherPriorityBlock;
+  const available = !blocked;
+
+  // etaSeconds: time until the card is free for a session.
+  //  - available now            -> 0
+  //  - a running job present     -> that job's etaS (may be null=unknown model)
+  //  - higher-priority residency -> null (unknown, no job to time)
+  let etaSeconds: number | null;
+  if (available) etaSeconds = 0;
+  else if (hasRunningJob && activeJob) etaSeconds = activeJob.etaS;
+  else etaSeconds = null;
+
+  return {
+    source: "hyperswap",
+    busyPct: numOrNull(gpu?.gpu_util_pct),
+    vramUsedGb: numOrNull(gpu?.vram_used_gb),
+    vramFreeGb: numOrNull(gpu?.vram_free_gb),
+    vramTotalGb: numOrNull(gpu?.vram_total_gb),
+    tempC: numOrNull(gpu?.temperature_c),
+    holder,
+    activeJob,
+    queueDepth,
+    etaSeconds,
+    available,
+    reclaimableIdleHolder,
+  };
+}
+
+let gpuStatusCache: { at: number; value: GpuStatus } | null = null;
+// Derived, cached GPU status. Never throws. `force` bypasses the cache (used to
+// confirm VRAM after a reclaim).
+async function getGpuStatus(force = false): Promise<GpuStatus> {
+  const now = Date.now();
+  if (!force && gpuStatusCache && now - gpuStatusCache.at < HYPERSWAP_CACHE_MS) return gpuStatusCache.value;
+  const base = hyperswapBase();
+  let value: GpuStatus;
+  if (!base) {
+    value = unavailableStatus();
+  } else {
+    // /api/gpu is the primary signal; if it is unreachable we report unavailable
+    // (and fail safe to the VRAM floor). tenants/stats/jobs are optional.
+    const [gpu, tenants, stats, jobsPayload] = await Promise.all([
+      hyperswapGet(base, "/api/gpu"),
+      hyperswapGet(base, "/api/tenants"),
+      hyperswapGet(base, "/api/stats"),
+      hyperswapGet(base, "/api/jobs"),
+    ]);
+    value = gpu ? deriveGpuStatus(gpu, tenants, stats, jobsPayload) : unavailableStatus();
+  }
+  gpuStatusCache = { at: now, value };
+  return value;
+}
+
+// Only the fields safe to publish to unauthenticated visitors (landing-page busy
+// meter): no IPs, no tenant internals beyond the holder NAME, busy% and ETA.
+function publicGpuStatus(s: GpuStatus) {
+  return { source: s.source, busyPct: s.busyPct, vramUsedGb: s.vramUsedGb, vramFreeGb: s.vramFreeGb, vramTotalGb: s.vramTotalGb, tempC: s.tempC, holder: s.holder, activeJob: s.activeJob, queueDepth: s.queueDepth, etaSeconds: s.etaSeconds, available: s.available };
+}
+
+// Sessions that occupy the box right now (a container is or is becoming live).
+function liveGpuSessionCount(): number {
+  const r = one<{ c: number }>(`SELECT COUNT(*) AS c FROM sessions WHERE state IN ('provisioning','running','stopping')`);
+  return r?.c || 0;
+}
+
+// Ask an idle reclaimable tenant to yield, then wait (bounded) for /api/gpu to
+// confirm the VRAM actually returned. Best effort; returns the final status.
+async function reclaimIdleAndConfirm(holder: string): Promise<GpuStatus> {
+  const base = hyperswapBase();
+  if (!base) return getGpuStatus(true);
+  console.log(`[gpu-queue] reclaiming idle reclaimable tenant '${holder}' to free the card for a session`);
+  await hyperswapRelease(base, holder);
+  const deadline = Date.now() + HYPERSWAP_RECLAIM_WAIT_MS;
+  let st = await getGpuStatus(true);
+  while (Date.now() < deadline && !st.available) {
+    await new Promise((r) => setTimeout(r, 1000));
+    st = await getGpuStatus(true);
+  }
+  return st;
+}
+
+// Turn an existing 'queued' (or freshly-created) session row into a live one:
+// allocate a noVNC port and a clean proxy, flip it to 'provisioning' and
+// dispatch the container. Shared by the immediate spawn path and the promoter.
+// Returns { ok } on dispatch, or { ok:false, retry } when a resource is
+// momentarily unavailable (no free port / no clean exit) so the caller can leave
+// the row queued and try again on the next sweep. NEVER charges — billing starts
+// only when the node reports the container running.
+function activateQueuedSession(row: any): { ok: boolean; retry?: boolean; error?: string } {
+  const port = allocateSessionPort();
+  if (port === null) return { ok: false, retry: true, error: "no free session ports" };
+  const proxy = assignProxy();
+  if (!proxy && REQUIRE_CLEAN_PROXY) return { ok: false, retry: true, error: "no clean egress available" };
+  const upd = q("UPDATE sessions SET port=?, proxy=?, state='provisioning' WHERE id=? AND state='queued'", port, proxy?.url ?? null, row.id);
+  // If the row was not still 'queued' (raced by a destroy/delete), do not dispatch.
+  if ((upd as any).changes === 0) return { ok: false, error: "session no longer queued" };
+  dispatchJob(row.node_hostname, "provision_ubuntu", "", { instanceId: row.instance_id, port, password: row.password, resolution: row.resolution, proxy: proxy?.url ?? null });
+  console.log(`[gpu-queue] promoted queued session ${row.id} -> provisioning on port ${port}`);
+  return { ok: true };
+}
+
+// Background promoter. Same idiom as the billing/reconcile sweeps: expire stale
+// queued rows, then, while the card is available and the box is under its
+// concurrency cap, promote queued sessions oldest-first. Never throws.
+async function promoteQueuedSessions(): Promise<void> {
+  try {
+    const queued = all<any>("SELECT * FROM sessions WHERE state='queued' ORDER BY created_at ASC");
+    if (!queued.length) return;
+    const now = Date.now();
+    // 1. Expire queued rows older than the TTL to 'failed' with a reason.
+    const live: any[] = [];
+    for (const s of queued) {
+      if (now - Number(s.created_at) > GPU_QUEUE_TTL_MS) {
+        const reason = `queued ${Math.round((now - Number(s.created_at)) / 60000)}m without the GPU becoming available (TTL ${Math.round(GPU_QUEUE_TTL_MS / 60000)}m)`;
+        q("UPDATE sessions SET state='failed', status_reason=? WHERE id=? AND state='queued'", reason, s.id);
+        console.warn(`[gpu-queue] expired queued session ${s.id}: ${reason}`);
+      } else {
+        live.push(s);
+      }
+    }
+    if (!live.length) return;
+    // 2. Promote oldest-first while the card is available and we are under cap,
+    //    re-checking availability before EACH promotion (the card may refill).
+    for (const s of live) {
+      if (liveGpuSessionCount() >= MAX_GPU_SESSIONS) break;
+      let st = await getGpuStatus(true);
+      if (st.source !== "hyperswap" || !st.available) {
+        // Not free yet. If an idle reclaimable tenant is parked on it, reclaim.
+        if (st.source === "hyperswap" && HYPERSWAP_RECLAIM_IDLE && st.reclaimableIdleHolder && !st.activeJob) {
+          st = await reclaimIdleAndConfirm(st.reclaimableIdleHolder);
+        }
+        if (st.source !== "hyperswap" || !st.available) break; // still not free — wait
+      } else if (st.reclaimableIdleHolder && HYPERSWAP_RECLAIM_IDLE) {
+        // Available but an idle model is parked; reclaim so the container gets VRAM.
+        await reclaimIdleAndConfirm(st.reclaimableIdleHolder);
+      }
+      const r = activateQueuedSession(s);
+      if (!r.ok && r.retry) break; // out of ports/proxies — try again next sweep
+    }
+  } catch (e) { console.error("[gpu-queue]", e); }
+}
+
+// Attach live queue info (etaSeconds/queueDepth/holder) to any 'queued' rows in
+// the array so /api/sessions and /api/me can render a countdown. One cached
+// arbitrator read for the whole array; never throws (degrades to unknown).
+async function attachQueueInfo(rows: any[]): Promise<void> {
+  const st = await getGpuStatus();
+  for (const r of rows) {
+    if (r.state !== "queued") continue;
+    r.etaSeconds = st.source === "hyperswap" ? st.etaSeconds : null;
+    r.queueDepth = st.source === "hyperswap" ? st.queueDepth : null;
+    r.holder = st.source === "hyperswap" ? st.holder : null;
+  }
+}
 /** Everything we know about, for the admin view. */
 function allProxyEndpoints(): ProxyEndpoint[] { return [...proxyEndpoints, ...(PROXY_FALLBACK_ENABLED ? fallbackEndpoints : [])]; }
 
@@ -1293,8 +1636,12 @@ async function startServer() {
   app.use("/api", (_req, res, next) => { res.setHeader("Cache-Control", "no-store"); next(); });
 
   // ===== PUBLIC =====
-  app.get("/api/health", (_req, res) => {
+  app.get("/api/health", async (_req, res) => {
     const now = Date.now();
+    // Real GPU busy meter for the landing page (logged-out visitors). Only the
+    // non-sensitive subset: no IPs, no tenant internals beyond the holder name,
+    // busy% and ETA. Never throws (cached, degrades to source='unavailable').
+    const gpuStatus = publicGpuStatus(await getGpuStatus());
     // Long-dead nodes are excluded from the advertised fleet size (and pruned by
     // the sweep above); the 30s online window is unchanged.
     const known = Object.values(nodes).filter((n) => !isStaleNode(n, now));
@@ -1325,8 +1672,20 @@ async function startServer() {
       // NO hardcoding (honesty rule: every user-facing price comes from here).
       // RESPONSE SHAPE ADDITION: new `catalog` array of {tier,label,priceUsdPerHour,kind}.
       catalog: CATALOG.map((t) => ({ tier: t.key, label: t.label, priceUsdPerHour: t.priceUsdPerHour, kind: t.kind })),
+      // RESPONSE SHAPE ADDITION: real GPU arbitrator meter (safe subset). Also
+      // hoist gpuBusyPct to the top level for a trivial landing-page read.
+      gpuBusyPct: gpuStatus.busyPct,
+      gpuStatus,
       timestamp: new Date().toISOString(),
     });
+  });
+
+  // Public GPU status straight from HyperSwap — REAL numbers only, no secrets.
+  // Backs the landing-page busy meter and the session-queue countdown. Every
+  // number is null when HyperSwap did not report it; source flips to
+  // 'unavailable' (never a 500) if the arbitrator cannot be reached.
+  app.get("/api/gpu-status", async (_req, res) => {
+    res.json(publicGpuStatus(await getGpuStatus()));
   });
 
   // This published the exact egress proxy IPs handed to tenant sessions, to
@@ -1453,11 +1812,14 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  app.get("/api/me", (req, res) => {
+  app.get("/api/me", async (req, res) => {
     const user = userFromReq(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
     const vms = all<any>("SELECT * FROM vms WHERE user_id=? ORDER BY created_at DESC", user.id);
     const sessions = all<any>("SELECT * FROM sessions WHERE user_id=? ORDER BY created_at DESC", user.id);
+    // Queued sessions carry etaSeconds/queueDepth/holder so the dashboard can
+    // show a countdown (see /api/sessions). null when unknown, never faked.
+    if (sessions.some((s) => s.state === "queued")) await attachQueueInfo(sessions);
     res.json({
       user: { id: user.id, username: user.username, balance_minutes: user.balance_minutes, unlimited: !!user.unlimited },
       vms, sessions,
@@ -1722,7 +2084,11 @@ async function startServer() {
     const reso = str(req.body?.resolution, "1440x900");
     if (!/^\d{3,5}x\d{3,5}$/.test(reso)) return res.status(400).json({ error: "resolution must look like 1440x900" });
     const unlimited = !!user.unlimited;
-    const active = countActive(user.id);
+    // A queued session has committed a machine slot even though nothing is
+    // running yet, so count queued rows alongside live ones — otherwise a user
+    // could stack unbounded queued rows past their per-account limit.
+    const queuedForUser = one<{ c: number }>("SELECT COUNT(*) AS c FROM sessions WHERE user_id=? AND state='queued'", user.id)?.c || 0;
+    const active = countActive(user.id) + queuedForUser;
     if (!unlimited && active >= FREE_MACHINES && user.balance_minutes <= 0) return res.status(402).json({ error: "insufficient balance — your first machine is free; top up with Bitcoin for more" });
     if (!unlimited && active >= MAX_VMS_PER_USER) return res.status(429).json({ error: `limit reached — max ${MAX_VMS_PER_USER} machines per account` });
     const freeDeniedSess = freeMachineDenial(req, user);
@@ -1734,6 +2100,66 @@ async function startServer() {
     if (!node || Date.now() - node.lastSeen > 30_000) {
       return res.status(503).json({ error: "GPU node offline — try again shortly" });
     }
+
+    // The /session/<instanceId>/ proxy is necessarily unauthenticated (noVNC
+    // loads it as a top-level iframe navigation with no Authorization header),
+    // so the instance id IS the capability. 4 bytes was guessable; use 16.
+    const instanceId = "sess_" + crypto.randomBytes(16).toString("hex");
+    const password = "Ub" + crypto.randomBytes(6).toString("hex") + "!";
+    const id = "ses_" + crypto.randomBytes(8).toString("hex");
+    // Every session is the GPU tier; lock its tier and price onto the row so the
+    // sweep bills it at the GPU rate (not the flat $1/hr it used to assume).
+    const gpuTier = TIERS["gpu"];
+
+    // Dispatch a live session RIGHT NOW (port + clean proxy + provision job) and
+    // respond 200. Used when the card is available (arbitrator) or when the VRAM
+    // floor passed (arbitrator unavailable). Nothing above this point charged.
+    const spawnNow = () => {
+      const port = allocateSessionPort();
+      if (port === null) return res.status(503).json({ error: "no free ports — try again shortly" });
+      // Clean-egress preflight. This product is sold on anonymity, so a session
+      // with no verified-clean proxy would egress from the operator's own WAN IP
+      // and deanonymise the tenant. Fails CLOSED: 503, no row, nothing charged.
+      const proxy = assignProxy(); // round-robin over provably-clean exits only
+      if (!proxy && REQUIRE_CLEAN_PROXY) {
+        const fb = PROXY_FALLBACK_ENABLED ? `, 0 of ${fallbackEndpoints.length} fallback exits` : "";
+        return res.status(503).json({ error: `no clean egress available — 0 of ${proxyEndpoints.length} configured proxies${fb} are verified clean, and this platform will not start an unproxied session. Nothing was charged; try again shortly.` });
+      }
+      q("INSERT INTO sessions (id,user_id,instance_id,node_hostname,node_ip,port,password,resolution,proxy,state,created_at,tier,price_usd_per_hour) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        id, user.id, instanceId, hostname, node.ip, port, password, reso, proxy?.url ?? null, "provisioning", Date.now(), gpuTier.key, gpuTier.priceUsdPerHour);
+      dispatchJob(hostname, "provision_ubuntu", "", { instanceId, port, password, resolution: reso, proxy: proxy?.url ?? null });
+      recordFreeMachine(req, user);
+      return res.json({ id, instanceId, port, password, resolution: reso, proxy: proxy?.url ?? null, state: "provisioning", url: `/session/${instanceId}/`, desktopUrl: desktopUrlFor(instanceId, password) });
+    };
+
+    // ---- Arbitrator-driven admission (HyperSwap) ----
+    // Replace the blunt VRAM 503 with "wait your turn": ask HyperSwap whether the
+    // card is available under the wait-patiently policy. When it is, spawn now
+    // (optionally reclaiming an IDLE reclaimable tenant first, then confirming via
+    // /api/gpu). When it is not — or we are at the box's concurrency cap — park a
+    // 'queued' session (no charge, no container) and let the promoter dispatch it
+    // when the card frees. When HyperSwap is unavailable we FAIL SAFE to the
+    // MIN_FREE_VRAM_MB floor so an outage still refuses a card it cannot confirm.
+    const status = await getGpuStatus();
+    if (status.source === "hyperswap") {
+      const underCap = liveGpuSessionCount() < MAX_GPU_SESSIONS;
+      let st = status;
+      // Card free but an idle model is parked — reclaim it (idle residency, not
+      // active work) and re-confirm the VRAM actually returned before committing.
+      if (st.available && underCap && HYPERSWAP_RECLAIM_IDLE && st.reclaimableIdleHolder && !st.activeJob) {
+        st = await reclaimIdleAndConfirm(st.reclaimableIdleHolder);
+      }
+      if (st.available && underCap) return spawnNow();
+      // Not available (or over cap): queue it. DO NOT charge, DO NOT dispatch.
+      // port=0 / proxy=null are placeholders the promoter fills at promotion.
+      q("INSERT INTO sessions (id,user_id,instance_id,node_hostname,node_ip,port,password,resolution,proxy,state,created_at,tier,price_usd_per_hour) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        id, user.id, instanceId, hostname, node.ip, 0, password, reso, null, "queued", Date.now(), gpuTier.key, gpuTier.priceUsdPerHour);
+      recordFreeMachine(req, user);
+      console.log(`[gpu-queue] queued session ${id} for ${user.username} (holder=${st.holder ?? "none"} etaSeconds=${st.etaSeconds ?? "unknown"} underCap=${underCap})`);
+      return res.status(202).json({ id, instanceId, state: "queued", etaSeconds: st.etaSeconds, queueDepth: st.queueDepth, holder: st.holder, url: `/session/${instanceId}/` });
+    }
+
+    // ---- Fallback: HyperSwap unavailable — the MIN_FREE_VRAM_MB floor ----
     // Capacity preflight against real nvidia-smi telemetry from the node.
     let freeVramMb = nodeFreeVramMb(node);
     if (MIN_FREE_VRAM_MB > 0 && node.memTotalMb > 0 && freeVramMb < MIN_FREE_VRAM_MB) {
@@ -1760,48 +2186,19 @@ async function startServer() {
         return res.status(503).json({ error: `GPU at capacity — ${freeVramMb} MiB VRAM free, ${MIN_FREE_VRAM_MB} MiB required. Nothing was charged; try again shortly.` });
       }
     }
-
-    // The /session/<instanceId>/ proxy is necessarily unauthenticated (noVNC
-    // loads it as a top-level iframe navigation with no Authorization header),
-    // so the instance id IS the capability. 4 bytes was guessable; use 16.
-    const instanceId = "sess_" + crypto.randomBytes(16).toString("hex");
-    const port = allocateSessionPort();
-    if (port === null) return res.status(503).json({ error: "no free ports — try again shortly" });
-
-    // Clean-egress preflight. This product is sold on anonymity, so a session
-    // with no verified-clean proxy would egress from the operator's own WAN IP
-    // and deanonymise the tenant. It used to fail OPEN: assignProxy() returned
-    // null on an empty pool and the spawn carried on regardless. It now fails
-    // CLOSED, exactly like the MIN_FREE_VRAM_MB preflight above — 503, no
-    // session row, no dispatched job, nothing charged. Set REQUIRE_CLEAN_PROXY=0
-    // to deliberately allow un-proxied sessions.
-    // Tier 1 (the operator's own boxes) is exhausted before any Tier 2 fallback
-    // exit is considered, and a Tier 2 exit had to pass the identical
-    // not-the-forbidden-IP probe to be in the running at all.
-    const proxy = assignProxy(); // round-robin over provably-clean exits only
-    if (!proxy && REQUIRE_CLEAN_PROXY) {
-      const fb = PROXY_FALLBACK_ENABLED ? `, 0 of ${fallbackEndpoints.length} fallback exits` : "";
-      return res.status(503).json({ error: `no clean egress available — 0 of ${proxyEndpoints.length} configured proxies${fb} are verified clean, and this platform will not start an unproxied session. Nothing was charged; try again shortly.` });
-    }
-
-    const password = "Ub" + crypto.randomBytes(6).toString("hex") + "!";
-    const id = "ses_" + crypto.randomBytes(8).toString("hex");
-
-    // Every session is the GPU tier; lock its tier and price onto the row so the
-    // sweep bills it at the GPU rate (not the flat $1/hr it used to assume).
-    const gpuTier = TIERS["gpu"];
-    q("INSERT INTO sessions (id,user_id,instance_id,node_hostname,node_ip,port,password,resolution,proxy,state,created_at,tier,price_usd_per_hour) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-      id, user.id, instanceId, hostname, node.ip, port, password, reso, proxy?.url ?? null, "provisioning", Date.now(), gpuTier.key, gpuTier.priceUsdPerHour);
-    dispatchJob(hostname, "provision_ubuntu", "", { instanceId, port, password, resolution: reso, proxy: proxy?.url ?? null });
-
-    recordFreeMachine(req, user);
-    res.json({ id, instanceId, port, password, resolution: reso, proxy: proxy?.url ?? null, state: "provisioning", url: `/session/${instanceId}/`, desktopUrl: desktopUrlFor(instanceId, password) });
+    return spawnNow();
   });
 
-  app.get("/api/sessions", (req, res) => {
+  app.get("/api/sessions", async (req, res) => {
     const user = userFromReq(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
-    res.json(all<any>("SELECT * FROM sessions WHERE user_id=? ORDER BY created_at DESC", user.id));
+    const rows = all<any>("SELECT * FROM sessions WHERE user_id=? ORDER BY created_at DESC", user.id);
+    // RESPONSE SHAPE ADDITION: rows with state='queued' carry etaSeconds,
+    // queueDepth and holder (live from the arbitrator) so the UI can show a
+    // countdown. Still a bare array — see CLAUDE.md gotcha — every other row is
+    // unchanged. etaSeconds is null when unknown, never a fabricated number.
+    if (rows.some((r) => r.state === "queued")) await attachQueueInfo(rows);
+    res.json(rows);
   });
 
   app.post("/api/session/destroy", (req, res) => {
@@ -1815,6 +2212,10 @@ async function startServer() {
     // gone (or missing one that is running).
     if (sess.state === "provisioning") return res.status(409).json({ error: "still provisioning — wait for it to finish before stopping" });
     if (sess.state === "stopped" || sess.state === "failed") return res.json({ ok: true });
+    // A queued session never had a container dispatched, so there is nothing to
+    // destroy on the node and it must not enter 'stopping' (which the billing
+    // sweep would treat as live). Cancel it straight to 'stopped'.
+    if (sess.state === "queued") { q("UPDATE sessions SET state='stopped', status_reason='cancelled while queued' WHERE id=? AND state='queued'", sess.id); return res.json({ ok: true }); }
     q("UPDATE sessions SET state='stopping' WHERE id=?", sess.id);
     dispatchJob(sess.node_hostname, "destroy_ubuntu", "", { instanceId: sess.instance_id });
     res.json({ ok: true });
@@ -2242,6 +2643,13 @@ ${opts.refreshSec ? `<div class="note">Retrying automatically every ${opts.refre
   const runReconcile = () => reconcileVms().catch((e) => console.warn("[reconcile] pass failed:", e?.message));
   runReconcile();
   setInterval(runReconcile, VM_RECONCILE_MS);
+
+  // GPU session queue promoter. Same idiom as the billing/reconcile sweeps:
+  // expire stale queued rows and promote the rest oldest-first as the shared
+  // card frees. A pass failure must never take the gateway down.
+  const runPromote = () => promoteQueuedSessions().catch((e) => console.warn("[gpu-queue] pass failed:", e?.message));
+  setInterval(runPromote, GPU_QUEUE_SWEEP_MS);
+  console.log(`[gpu-queue] promoter every ${GPU_QUEUE_SWEEP_MS}ms | max ${MAX_GPU_SESSIONS} live sessions | queue TTL ${Math.round(GPU_QUEUE_TTL_MS / 60000)}m | reclaim-idle ${HYPERSWAP_RECLAIM_IDLE ? "on" : "off"}`);
 
   // Confirm the configured templates actually exist and are templates. Without
   // this a typo'd VMID only surfaces when a tenant provisions: the clone fails
