@@ -33,6 +33,13 @@ export interface Health {
    *  ./catalog) rather than showing an empty storefront. When present it is the
    *  source of truth for every tier's label and price. */
   catalog?: Array<{ tier: string; label: string; priceUsdPerHour: number; kind: 'pct' | 'qm' | 'gpu' }>;
+  /** Coarse, public GPU load for logged-out visitors, if the gateway surfaces
+   *  it on the health payload. `gpuBusyPct` is a REAL polled utilisation %;
+   *  `gpuStatus` mirrors the gpu-status `source`. Both optional — when absent
+   *  the landing page hides the indicator rather than inventing a number, and
+   *  a `gpuStatus:'unavailable'` also hides it (never show a stale figure). */
+  gpuBusyPct?: number;
+  gpuStatus?: 'hyperswap' | 'unavailable' | string;
 }
 
 /** MiB is the unit the gateway speaks, so every hard number stays MiB. Only the

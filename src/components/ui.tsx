@@ -103,12 +103,53 @@ export function Alert({
   );
 }
 
+/**
+ * A GPU utilisation meter. The bar is decorative (`aria-hidden`); the semantics
+ * ride on `role="meter"` with valuemin/max/now and an `aria-valuetext`, and a
+ * visible "NN% busy" text equivalent sits alongside for sighted users. `pct` is
+ * a real reading — pass null when it is unknown and the meter renders an
+ * indeterminate track with a "—" readout rather than a fake 0%.
+ */
+export function GpuMeter({
+  pct, label = 'GPU utilisation', className,
+}: { pct: number | null; label?: string; className?: string }) {
+  const known = pct != null && Number.isFinite(pct);
+  const value = known ? Math.min(100, Math.max(0, pct as number)) : 0;
+  // Hot cards read amber/red; a quiet card reads cyan. Purely visual signal.
+  const bar = !known ? 'bg-zinc-600'
+    : value >= 90 ? 'bg-red-400'
+      : value >= 60 ? 'bg-amber-400'
+        : 'bg-cyan-400';
+  const readout = known ? `${Math.round(value)}%` : '—';
+  return (
+    <div className={cx('flex items-center gap-2', className)}>
+      <div
+        role="meter"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        {...(known ? { 'aria-valuenow': Math.round(value) } : {})}
+        aria-valuetext={known ? `${Math.round(value)}% busy` : 'utilisation unknown'}
+        className="h-1.5 flex-1 overflow-hidden rounded-full bg-white/10"
+      >
+        <div
+          className={cx('h-full rounded-full transition-[width] duration-500', bar)}
+          style={{ width: `${value}%` }}
+          aria-hidden="true"
+        />
+      </div>
+      <span className="shrink-0 font-mono text-[11px] tabular-nums text-zinc-300">{readout}</span>
+    </div>
+  );
+}
+
 export function StateBadge({ state }: { state: string }) {
   const cls =
     state === 'running' ? 'bg-emerald-400/15 text-emerald-300 ring-emerald-400/30'
       : state === 'provisioning' ? 'bg-amber-400/15 text-amber-300 ring-amber-400/30'
-        : state === 'failed' ? 'bg-red-500/15 text-red-300 ring-red-500/30'
-          : 'bg-white/5 text-zinc-400 ring-white/10';
+        : state === 'queued' ? 'bg-cyan-400/15 text-cyan-300 ring-cyan-400/30'
+          : state === 'failed' ? 'bg-red-500/15 text-red-300 ring-red-500/30'
+            : 'bg-white/5 text-zinc-400 ring-white/10';
   return (
     <span className={cx('rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ring-1', cls)}>
       {state}
