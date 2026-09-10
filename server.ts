@@ -144,14 +144,21 @@ const MAX_INVOICE_CENTS = 1_000_000; // $10,000 ceiling on a single top-up
 // cannot run anything on the GPU — while still billing them. Refuse instead.
 // Set to 0 to disable the preflight.
 const MIN_FREE_VRAM_MB = Number.isFinite(Number(process.env.MIN_FREE_VRAM_MB)) ? Number(process.env.MIN_FREE_VRAM_MB) : 2048;
-// A paying GPU-session tenant should get the card even when the operator's own
-// ollama workload (HyperSwap) has a model resident. When a spawn is blocked on
-// VRAM and this is on (default), the gateway asks ollama to unload its resident
-// models, then waits for the node's telemetry to confirm the VRAM actually came
-// back before proceeding. ollama reloads the model on its next request, so this
-// preempts rather than kills. Set 0 to leave ollama untouched (spawn just 503s
-// when the card is full, the prior behaviour).
-const GPU_PREEMPT_OLLAMA = str(process.env.GPU_PREEMPT_OLLAMA, "1").trim() !== "0";
+// When a GPU spawn is blocked on VRAM, optionally ask the node's ollama to
+// unload its resident models, then wait for the node's telemetry to confirm the
+// VRAM actually returned before proceeding (same source of truth as the check,
+// so we never proceed on assumption).
+//
+// DEFAULT OFF, and here is why: measured on this fleet, HyperSwap keeps a live
+// connection to ollama and OLLAMA_KEEP_ALIVE=30m pins its ~14GB model, so it
+// re-pins within seconds of any unload — the eviction is acknowledged
+// (`done_reason: unload`) but the VRAM never comes back while HyperSwap runs.
+// Turning this on there only disrupts the LLM for no gain. It IS effective when
+// HyperSwap is stopped or its model footprint leaves >= MIN_FREE_VRAM_MB free.
+// The real fix for coexistence is node-side (shrink the model's context/quant,
+// lower OLLAMA_KEEP_ALIVE, or pause HyperSwap while a session is active) and is
+// not something the gateway can reach.
+const GPU_PREEMPT_OLLAMA = str(process.env.GPU_PREEMPT_OLLAMA, "0").trim() === "1";
 // Where the session node's ollama listens. Empty = derive http://<node ip>:11434
 // from the node's own telemetry at spawn time.
 const OLLAMA_URL = str(process.env.OLLAMA_URL, "");
