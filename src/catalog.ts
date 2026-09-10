@@ -177,20 +177,32 @@ export function catalogRange(cards: TierCard[]): { min: number; max: number } | 
  *  Returns null when there is nothing truthful to show — the caller then keeps
  *  its existing os-derived label and shows no fabricated price. */
 export function resolveRowTier(
-  row: { tier?: string | null; tier_label?: string | null; price_per_hour?: number | null },
+  // The server stores the tier and its LOCKED-IN price on each row as `tier`
+  // and `price_usd_per_hour` (see server.ts ensureColumn); the label rides in
+  // `sku`. `price_per_hour`/`tier_label` are accepted only as legacy aliases so
+  // an older payload still resolves. The row's own price is preferred over the
+  // catalog's so a later price change is not retroactively shown on a machine
+  // that was quoted — and billed — at the old rate.
+  row: {
+    tier?: string | null;
+    price_usd_per_hour?: number | null;
+    sku?: string | null;
+    tier_label?: string | null;
+    price_per_hour?: number | null;
+  },
   cards: TierCard[],
 ): { label: string; price: number | null } | null {
   const tier = typeof row.tier === 'string' ? row.tier : null;
   if (!tier) return null;
   const card = cards.find((c) => c.tier === tier);
-  // Prefer a label/price the row carries; otherwise borrow the catalog's.
+  const rowPrice = [row.price_usd_per_hour, row.price_per_hour].find(
+    (p): p is number => typeof p === 'number' && Number.isFinite(p),
+  );
   const label =
-    (typeof row.tier_label === 'string' && row.tier_label) || card?.label || tier;
-  const price =
-    typeof row.price_per_hour === 'number' && Number.isFinite(row.price_per_hour)
-      ? row.price_per_hour
-      : card
-        ? card.priceUsdPerHour
-        : null;
+    (typeof row.sku === 'string' && row.sku) ||
+    (typeof row.tier_label === 'string' && row.tier_label) ||
+    card?.label ||
+    tier;
+  const price = rowPrice ?? (card ? card.priceUsdPerHour : null);
   return { label, price };
 }
