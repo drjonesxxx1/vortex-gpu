@@ -100,7 +100,10 @@ describe("provisioning: routing qm vs pct by tier", () => {
     assert.equal(r.status, 200, r.text);
     assert.equal(r.json.tier, "ubuntu-ct");
     assert.equal(r.json.priceUsdPerHour, 1);
-    assert.equal(r.json.access.protocol, "ssh");
+    // CT tiers now get an in-browser terminal proxied through the gateway, not a
+    // dead private-IP SSH string. access is null; terminalUrl points at /machine/.
+    assert.equal(r.json.access, null, "CT must not present a (non-functional) private-IP ssh access block");
+    assert.match(r.json.terminalUrl, /^\/machine\/vm_/, "CT must return a browser terminal URL");
     assert.ok(await waitForSsh(srv, /pct clone 991/), `expected pct clone in: ${srv.sshCalls().join(" | ")}`);
     assert.ok(!srv.sshCalls().some((c) => /qm clone/.test(c)), "a CT must never use qm clone");
   });

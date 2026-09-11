@@ -519,6 +519,21 @@ async function ctStatus(ctid: number): Promise<string> {
 async function reclaimCt(ctid: number): Promise<{ ok: boolean; out: string }> {
   return pve(["pct", "destroy", String(ctid), "--purge"]);
 }
+// The container's REAL LAN IP (DHCP on vmbr0), not the Proxmox host. The gateway
+// reverse-proxies the in-browser terminal (ttyd :7681) to this address, so the
+// renter never sees an internal IP and never needs a port-forward that does not
+// exist. DHCP takes a moment after start, so the caller polls.
+async function ctGuestIp(ctid: number): Promise<string | null> {
+  const r = await pve(["pct", "exec", String(ctid), "--", "hostname", "-I"]);
+  if (!r.ok) return null;
+  for (const tok of r.out.trim().split(/\s+/)) {
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(tok) && !tok.startsWith("127.")) return tok;
+  }
+  return null;
+}
+// Port the ttyd browser terminal listens on inside every CT (baked into the
+// vortex-ct-ttyd template via a systemd unit).
+const TTYD_PORT = Math.max(1, num(process.env.TTYD_PORT, 7681));
 
 // How often to re-read the host and correct drifted vm rows, and how old a row
 // must be before it is eligible (so a clone still in flight is never touched).
@@ -1898,7 +1913,14 @@ async function startServer() {
         if (!r.ok) { q("UPDATE vms SET state='failed' WHERE id=?", vmUid); return; }
         await setCtPassword(vmid, username, password);
         const s = await startCt(vmid);
-        q("UPDATE vms SET state=?, ip=? WHERE id=?", s.ok ? "running" : "failed", PVE_HOST, vmUid);
+        if (!s.ok) { q("UPDATE vms SET state='failed' WHERE id=?", vmUid); return; }
+        // Capture the container's REAL LAN IP (not PVE_HOST). Without a real IP
+        // the browser terminal cannot be proxied, so a row with no IP is a
+        // failed provision, not a running machine claiming a bogus address.
+        let ip: string | null = null;
+        for (let i = 0; i < 8 && !ip; i++) { ip = await ctGuestIp(vmid); if (!ip) await new Promise((r2) => setTimeout(r2, 2000)); }
+        if (!ip) { q("UPDATE vms SET state='failed' WHERE id=?", vmUid); console.error(`[vms] CT ${vmid} never reported a LAN IP; marking failed`); return; }
+        q("UPDATE vms SET state='running', ip=? WHERE id=?", ip, vmUid);
       });
     } else {
       cloneVm(template, vmid, name).then(async (r) => {
@@ -1910,12 +1932,19 @@ async function startServer() {
     }
 
     recordFreeMachine(req, user);
+    // CT tiers get an in-browser terminal proxied through the gateway (public
+    // via Cloudflare) — the only path a remote renter can actually reach. The
+    // old `access: {host: PVE_HOST, port}` was a private LAN IP with a random
+    // port nothing forwarded, so it never connected; do not present it for CTs.
+    const browserTerminal = isPct;
     res.json({
-      // RESPONSE SHAPE ADDITION: `tier` and `priceUsdPerHour` now accompany the
-      // existing fields. `os` and `sku` are unchanged in type.
+      // RESPONSE SHAPE: `tier`/`priceUsdPerHour` accompany the existing fields;
+      // `terminalUrl` (string|null) is the browser-terminal path for CT tiers.
       vmId: vmUid, tier: tier.key, priceUsdPerHour: tier.priceUsdPerHour,
       os: tier.os, sku: tier.label, state: "provisioning",
-      access: { protocol, host: PVE_HOST, port, username, password },
+      terminalUrl: browserTerminal ? `/machine/${vmUid}/` : null,
+      username, password,
+      access: browserTerminal ? null : { protocol, host: PVE_HOST, port, username, password },
       app: appName,
     });
   });
@@ -2594,6 +2623,51 @@ ${opts.refreshSec ? `<div class="note">Retrying automatically every ${opts.refre
   });
   app.use(sessionProxy);
 
+  // ===== BROWSER TERMINAL PROXY (CT/VM ttyd) =====
+  // A rented CT is reachable only on the LAN; the gateway is public via
+  // Cloudflare. So the in-browser terminal (ttyd on the guest's :TTYD_PORT) is
+  // proxied through here at /machine/<vmUid>/, exactly like the GPU noVNC proxy.
+  // The vmUid in the path is the capability (top-level browser navigation, no
+  // Authorization header possible). Gated on the row being running with a real IP.
+  app.use("/machine/:vmUid", (req, res, next) => {
+    const vm = one<any>("SELECT * FROM vms WHERE id=?", req.params.vmUid);
+    res.setHeader("Cache-Control", "no-store");
+    if (!vm) return res.status(404).type("html").send(sessionEndedPage(req.params.vmUid));
+    if (vm.state === "provisioning") return res.status(503).type("html").send(desktopStartingPage(vm.id));
+    if (vm.state !== "running" || !vm.ip || vm.ip === PVE_HOST) return res.status(410).type("html").send(sessionEndedPage(vm.id));
+    next();
+  });
+  const machineProxy = createProxyMiddleware({
+    target: "http://127.0.0.1:1",
+    changeOrigin: true,
+    ws: true,
+    pathFilter: "/machine/**",
+    router: (req) => {
+      const m = (req.url || "").match(/^\/machine\/([^/]+)/);
+      if (!m) return "http://127.0.0.1:1";
+      const vm = one<any>("SELECT * FROM vms WHERE id=?", m[1]);
+      // Repeat the gate: WebSocket upgrades (ttyd uses WS) bypass the express stack.
+      return vm && vm.state === "running" && vm.ip && vm.ip !== PVE_HOST
+        ? `http://${vm.ip}:${TTYD_PORT}` : "http://127.0.0.1:1";
+    },
+    pathRewrite: (path) => path.replace(/^\/machine\/[^/]+/, "") || "/",
+    on: {
+      error: (err, req, res) => {
+        console.error(`[machine-proxy] ${req.url}: ${(err as NodeJS.ErrnoException)?.code || err}`);
+        const rawUrl = (req as express.Request).originalUrl || req.url || "";
+        const m = rawUrl.match(/^\/machine\/([^/]+)/);
+        const id = m ? m[1] : "";
+        if (res && typeof (res as http.ServerResponse).writeHead === "function") {
+          const r = res as http.ServerResponse;
+          if (!r.headersSent) { r.writeHead(503, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }); r.end(desktopStartingPage(id)); }
+        } else if (res && typeof (res as unknown as { destroy?: () => void }).destroy === "function") {
+          (res as unknown as { destroy: () => void }).destroy();
+        }
+      },
+    },
+  });
+  app.use(machineProxy);
+
   // ===== STATIC =====
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
@@ -2678,7 +2752,13 @@ ${opts.refreshSec ? `<div class="note">Retrying automatically every ${opts.refre
     console.log(`[VortexGPU] Proxmox ${PVE_HOST} | tiers: ${CATALOG.map((t) => `${t.key}=$${t.priceUsdPerHour}/hr(${t.kind}${t.template ? " " + t.template : ""})`).join(" | ")}`);
     console.log(`[VortexGPU] GPU SKU: ${GPU_SKU} | base $${PRICE_USD_PER_HOUR}/hr | ${FREE_MACHINES} free machine(s)`);
   });
-  server.on("upgrade", sessionProxy.upgrade);
+  // Route WS upgrades by path: noVNC sessions vs CT browser terminals. Both
+  // bypass the express stack, so each proxy's router re-checks the row's state.
+  server.on("upgrade", (req, socket, head) => {
+    const url = req.url || "";
+    if (url.startsWith("/machine/")) return (machineProxy as any).upgrade(req, socket, head);
+    return (sessionProxy as any).upgrade(req, socket, head);
+  });
 }
 
 startServer().catch((e) => { console.error(e); process.exit(1); });
