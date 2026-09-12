@@ -13,25 +13,23 @@ interface CyberCanvasProps {
 }
 
 const COLORS: Record<CanvasState, { edge: number; core: number; speed: number; opacity: number }> = {
-  running:   { edge: 0x22d3ee, core: 0xffffff, speed: 1.0,  opacity: 0.85 },
-  booting:   { edge: 0xfbbf24, core: 0xfff7e0, speed: 0.55, opacity: 0.75 },
-  stopping:  { edge: 0xfbbf24, core: 0xffe0c0, speed: 0.3,  opacity: 0.6 },
-  suspended: { edge: 0x64748b, core: 0xcbd5e1, speed: 0.18, opacity: 0.5 },
-  off:       { edge: 0x445566, core: 0x8899aa, speed: 0.08, opacity: 0.4 },
+  running:   { edge: 0x22d3ee, core: 0xffffff, speed: 1.0,  opacity: 0.9 },
+  booting:   { edge: 0xfbbf24, core: 0xfff7e0, speed: 0.55, opacity: 0.8 },
+  stopping:  { edge: 0xfbbf24, core: 0xffe0c0, speed: 0.3,  opacity: 0.65 },
+  suspended: { edge: 0x64748b, core: 0xcbd5e1, speed: 0.18, opacity: 0.55 },
+  off:       { edge: 0x445566, core: 0x8899aa, speed: 0.08, opacity: 0.45 },
 };
 
-const PARTICLE_COUNT = 11000;
+const PARTICLE_COUNT = 9000;
 const ARM_COUNT = 3;
-const TWIST = 1.35;      // radians per unit radius — how tightly the arms wind
+const TWIST = 1.35;
 const MAX_RADIUS = 6.2;
 
 interface Star {
   radius: number;
   angle: number;
   y: number;
-  omega: number;   // angular velocity (differential — inner spins faster)
-  size: number;
-  mix: number;
+  omega: number;
 }
 
 function prefersReducedMotion(): boolean {
@@ -40,6 +38,27 @@ function prefersReducedMotion(): boolean {
     typeof window.matchMedia === 'function' &&
     window.matchMedia('(prefers-reduced-motion: reduce)').matches
   );
+}
+
+/** Soft radial-gradient sprite so particles render smooth, not aliased/sparkly. */
+function makeSprite(): THREE.Texture {
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    g.addColorStop(0, 'rgba(255,255,255,1)');
+    g.addColorStop(0.3, 'rgba(255,255,255,0.9)');
+    g.addColorStop(0.6, 'rgba(255,255,255,0.35)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.needsUpdate = true;
+  return tex;
 }
 
 export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
@@ -59,7 +78,7 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
 
     let renderer: THREE.WebGLRenderer;
     try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     } catch {
       setFailed(true);
       return;
@@ -69,7 +88,6 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     const height = container.clientHeight || 320;
 
     const scene = new THREE.Scene();
-    // Near-top-down camera so the spiral arms read clearly as a vortex.
     const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 1000);
     camera.position.set(0, 8.2, 3.6);
     camera.lookAt(0, 0, 0);
@@ -81,81 +99,55 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     container.appendChild(renderer.domElement);
 
     const state = COLORS[vmState] ?? COLORS.off;
+    const sprite = makeSprite();
 
     // ---- Spiral-galaxy particle field ----
     const stars: Star[] = [];
     const positions = new Float32Array(PARTICLE_COUNT * 3);
-    const sizes = new Float32Array(PARTICLE_COUNT);
-    const mixes = new Float32Array(PARTICLE_COUNT);
+    const colors = new Float32Array(PARTICLE_COUNT * 3);
+    const edgeColor = new THREE.Color(state.edge);
+    const coreColor = new THREE.Color(state.core);
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
       const arm = i % ARM_COUNT;
       const armOffset = (arm / ARM_COUNT) * Math.PI * 2;
-      // Logarithmic spiral: angle winds with radius. Mild centre bias, no ring.
       const radius = 0.5 + Math.pow(Math.random(), 0.7) * (MAX_RADIUS - 0.5);
       const angle = armOffset + radius * TWIST + (Math.random() - 0.5) * 0.7;
       const y = (Math.random() - 0.5) * 1.1;
-      // Differential rotation — inner orbits faster (this is what winds a galaxy).
       const omega = 1.1 / Math.pow(radius, 0.55);
-      const size = 0.035 + Math.random() * 0.08;
       const mix = Math.max(0, Math.min(1, 1 - (radius - 0.5) / (MAX_RADIUS - 0.5)));
 
-      stars.push({ radius, angle, y, omega, size, mix });
+      stars.push({ radius, angle, y, omega });
       positions[i * 3] = Math.cos(angle) * radius;
       positions[i * 3 + 1] = y;
       positions[i * 3 + 2] = Math.sin(angle) * radius;
-      sizes[i] = size;
-      mixes[i] = mix;
+
+      const c = edgeColor.clone().lerp(coreColor, mix);
+      colors[i * 3] = c.r;
+      colors[i * 3 + 1] = c.g;
+      colors[i * 3 + 2] = c.b;
     }
 
     const particleGeo = new THREE.BufferGeometry();
     particleGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    particleGeo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
-    particleGeo.setAttribute('aMix', new THREE.BufferAttribute(mixes, 1));
+    particleGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 
-    const particleMat = new THREE.ShaderMaterial({
-      uniforms: {
-        uEdgeColor: { value: new THREE.Color(state.edge) },
-        uCoreColor: { value: new THREE.Color(state.core) },
-        uOpacity: { value: state.opacity },
-        uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
-      },
-      vertexShader: /* glsl */ `
-        attribute float aSize;
-        attribute float aMix;
-        varying float vMix;
-        void main() {
-          vMix = aMix;
-          vec4 mv = modelViewMatrix * vec4(position, 1.0);
-          gl_PointSize = aSize * uPixelRatio * (300.0 / -mv.z);
-          gl_Position = projectionMatrix * mv;
-        }
-      `,
-      fragmentShader: /* glsl */ `
-        uniform vec3 uEdgeColor;
-        uniform vec3 uCoreColor;
-        uniform float uOpacity;
-        varying float vMix;
-        void main() {
-          vec2 uv = gl_PointCoord - vec2(0.5);
-          float d = length(uv) * 2.0;
-          if (d > 1.0) discard;
-          float glow = pow(1.0 - d, 2.0);
-          vec3 color = mix(uEdgeColor, uCoreColor, vMix);
-          float intensity = 0.75 + vMix * 0.9;
-          gl_FragColor = vec4(color * intensity, glow * uOpacity);
-        }
-      `,
+    const particleMat = new THREE.PointsMaterial({
+      size: 0.22,
+      map: sprite,
+      vertexColors: true,
       transparent: true,
-      depthWrite: false,
+      opacity: state.opacity,
       blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      sizeAttenuation: true,
     });
 
     const particleSystem = new THREE.Points(particleGeo, particleMat);
     scene.add(particleSystem);
 
     // Central bright core.
-    const hotGeo = new THREE.IcosahedronGeometry(0.22, 1);
+    const hotGeo = new THREE.IcosahedronGeometry(0.24, 1);
     const hotMat = new THREE.MeshBasicMaterial({
       color: 0xffffff,
       transparent: true,
@@ -187,20 +179,15 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
 
       for (let i = 0; i < PARTICLE_COUNT; i++) {
         const s = stars[i];
-        // Differential rotation: each star orbits at its own angular speed.
         s.angle += s.omega * dt * speed;
-        const x = Math.cos(s.angle) * s.radius;
-        const z = Math.sin(s.angle) * s.radius;
-        pos.setXYZ(i, x, s.y, z);
+        pos.setXYZ(i, Math.cos(s.angle) * s.radius, s.y, Math.sin(s.angle) * s.radius);
       }
       pos.needsUpdate = true;
 
-      // Core pulse.
       hotMesh.scale.setScalar(1 + (clamp / 100) * 0.5 + Math.sin(elapsed * 4.0) * 0.12);
       hotMesh.rotation.x += dt * 0.5;
       hotMesh.rotation.y += dt * 0.8;
 
-      // Slow cinematic sway.
       camera.position.x = Math.sin(elapsed * 0.12) * 1.2;
       camera.lookAt(0, 0, 0);
 
@@ -274,6 +261,7 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
       if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
       particleGeo.dispose();
       particleMat.dispose();
+      sprite.dispose();
       hotGeo.dispose();
       hotMat.dispose();
       renderer.dispose();
