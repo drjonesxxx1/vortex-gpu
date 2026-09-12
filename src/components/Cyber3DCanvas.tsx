@@ -17,11 +17,11 @@ interface CyberCanvasProps {
 
 // State-driven palette: edge colour, white-hot core colour, base spin speed, particle opacity.
 const COLORS: Record<CanvasState, { edge: number; core: number; speed: number; opacity: number }> = {
-  running:   { edge: 0x22d3ee, core: 0xf0ffff, speed: 1.0,  opacity: 1.0 },
-  booting:   { edge: 0xfbbf24, core: 0xfff7e0, speed: 0.55, opacity: 0.9 },
-  stopping:  { edge: 0xfbbf24, core: 0xffe0c0, speed: 0.3,  opacity: 0.7 },
-  suspended: { edge: 0x64748b, core: 0xcbd5e1, speed: 0.18, opacity: 0.55 },
-  off:       { edge: 0x445566, core: 0x8899aa, speed: 0.08, opacity: 0.4 },
+  running:   { edge: 0x22d3ee, core: 0xffffff, speed: 1.0,  opacity: 0.8 },
+  booting:   { edge: 0xfbbf24, core: 0xfff7e0, speed: 0.55, opacity: 0.7 },
+  stopping:  { edge: 0xfbbf24, core: 0xffe0c0, speed: 0.3,  opacity: 0.55 },
+  suspended: { edge: 0x64748b, core: 0xcbd5e1, speed: 0.18, opacity: 0.45 },
+  off:       { edge: 0x445566, core: 0x8899aa, speed: 0.08, opacity: 0.35 },
 };
 
 const PARTICLE_COUNT = 9000;
@@ -93,10 +93,10 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     // Post-processing bloom for the glow.
     const composer = new EffectComposer(renderer);
     composer.addPass(new RenderPass(scene, camera));
-    const bloom = new UnrealBloomPass(new THREE.Vector2(width, height), 1.0, 0.45, 0.72);
-    bloom.threshold = 0.0;
-    bloom.strength = 1.35;
-    bloom.radius = 0.7;
+    const bloom = new UnrealBloomPass(new THREE.Vector2(width, height), 0.8, 0.5, 0.55);
+    bloom.threshold = 0.3;
+    bloom.strength = 0.6;
+    bloom.radius = 0.5;
     composer.addPass(bloom);
 
     const state = COLORS[vmState] ?? COLORS.off;
@@ -114,7 +114,7 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
       const angle = Math.random() * Math.PI * 2;
       const y = (Math.random() - 0.5) * 3.2;
       const angularBase = 0.5 + Math.random() * 0.6;
-      const size = 0.55 + Math.random() * 1.6;
+      const size = 0.04 + Math.random() * 0.09;
       const phase = Math.random();
       const mix = Math.max(0, Math.min(1, 1 - (radius - 0.35) / 6.4));
 
@@ -150,7 +150,7 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
           vMix = aMix;
           vPhase = aPhase;
           vec4 mv = modelViewMatrix * vec4(position, 1.0);
-          gl_PointSize = aSize * uPixelRatio * (240.0 / -mv.z);
+          gl_PointSize = aSize * uPixelRatio * (300.0 / -mv.z);
           gl_Position = projectionMatrix * mv;
         }
       `,
@@ -165,9 +165,9 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
           float d = length(uv) * 2.0;
           if (d > 1.0) discard;
           float glow = pow(1.0 - d, 2.0);
-          float twinkle = 0.75 + 0.25 * sin(vPhase * 6.28318);
+          float twinkle = 0.85 + 0.15 * sin(vPhase * 6.28318);
           vec3 color = mix(uEdgeColor, uCoreColor, vMix);
-          float intensity = 1.0 + vMix * 2.2;
+          float intensity = 0.8 + vMix * 1.0;
           gl_FragColor = vec4(color * intensity, glow * uOpacity * twinkle);
         }
       `,
@@ -185,7 +185,7 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
       color: 0xffffff,
       wireframe: true,
       transparent: true,
-      opacity: 0.55,
+      opacity: 0.45,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
     });
@@ -196,7 +196,7 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     const hotMat = new THREE.MeshBasicMaterial({
       color: 0xffffff,
       transparent: true,
-      opacity: 0.9,
+      opacity: 0.5,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
     });
