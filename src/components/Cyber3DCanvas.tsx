@@ -12,7 +12,6 @@ interface CyberCanvasProps {
   className?: string;
 }
 
-// State-driven palette: edge colour, white-hot core colour, base spin speed, particle opacity.
 const COLORS: Record<CanvasState, { edge: number; core: number; speed: number; opacity: number }> = {
   running:   { edge: 0x22d3ee, core: 0xffffff, speed: 1.0,  opacity: 0.85 },
   booting:   { edge: 0xfbbf24, core: 0xfff7e0, speed: 0.55, opacity: 0.75 },
@@ -21,15 +20,17 @@ const COLORS: Record<CanvasState, { edge: number; core: number; speed: number; o
   off:       { edge: 0x445566, core: 0x8899aa, speed: 0.08, opacity: 0.4 },
 };
 
-const PARTICLE_COUNT = 9000;
+const PARTICLE_COUNT = 11000;
+const ARM_COUNT = 3;
+const TWIST = 1.35;      // radians per unit radius — how tightly the arms wind
+const MAX_RADIUS = 6.2;
 
-interface VortexParticle {
+interface Star {
   radius: number;
   angle: number;
   y: number;
-  angularBase: number;
+  omega: number;   // angular velocity (differential — inner spins faster)
   size: number;
-  phase: number;
   mix: number;
 }
 
@@ -41,15 +42,6 @@ function prefersReducedMotion(): boolean {
   );
 }
 
-/**
- * Decorative WebGL centrepiece for the hero.
- *
- * Accessibility / performance contract:
- *  - aria-hidden: it carries no information a screen reader needs.
- *  - prefers-reduced-motion: renders exactly one still frame, no rAF loop.
- *  - pauses entirely while the tab is hidden or the element is off-screen.
- *  - if WebGL context creation fails, falls back to a static CSS treatment.
- */
 export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
   vmState,
   intensity = 60,
@@ -77,10 +69,10 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     const height = container.clientHeight || 320;
 
     const scene = new THREE.Scene();
-    // Elevated camera so the spiral disc reads clearly, not edge-on.
+    // Near-top-down camera so the spiral arms read clearly as a vortex.
     const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 1000);
-    camera.position.set(0, 4.4, 7.5);
-    camera.lookAt(0, -0.2, 0);
+    camera.position.set(0, 8.2, 3.6);
+    camera.lookAt(0, 0, 0);
 
     renderer.setSize(width, height);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -90,37 +82,36 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
 
     const state = COLORS[vmState] ?? COLORS.off;
 
-    // ---- Build the physics-driven particle vortex ----
-    const particles: VortexParticle[] = [];
+    // ---- Spiral-galaxy particle field ----
+    const stars: Star[] = [];
     const positions = new Float32Array(PARTICLE_COUNT * 3);
     const sizes = new Float32Array(PARTICLE_COUNT);
     const mixes = new Float32Array(PARTICLE_COUNT);
-    const phases = new Float32Array(PARTICLE_COUNT);
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
-      // Bias radius toward the core so the vortex is dense and bright in the middle.
-      const radius = 0.3 + Math.pow(Math.random(), 1.35) * 6.0;
-      const angle = Math.random() * Math.PI * 2;
-      const y = (Math.random() - 0.5) * 2.4;
-      const angularBase = 0.5 + Math.random() * 0.6;
-      const size = 0.03 + Math.random() * 0.08;
-      const phase = Math.random();
-      const mix = Math.max(0, Math.min(1, 1 - (radius - 0.3) / 6.0));
+      const arm = i % ARM_COUNT;
+      const armOffset = (arm / ARM_COUNT) * Math.PI * 2;
+      // Logarithmic spiral: angle winds with radius. Mild centre bias, no ring.
+      const radius = 0.5 + Math.pow(Math.random(), 0.7) * (MAX_RADIUS - 0.5);
+      const angle = armOffset + radius * TWIST + (Math.random() - 0.5) * 0.7;
+      const y = (Math.random() - 0.5) * 1.1;
+      // Differential rotation — inner orbits faster (this is what winds a galaxy).
+      const omega = 1.1 / Math.pow(radius, 0.55);
+      const size = 0.035 + Math.random() * 0.08;
+      const mix = Math.max(0, Math.min(1, 1 - (radius - 0.5) / (MAX_RADIUS - 0.5)));
 
-      particles.push({ radius, angle, y, angularBase, size, phase, mix });
+      stars.push({ radius, angle, y, omega, size, mix });
       positions[i * 3] = Math.cos(angle) * radius;
       positions[i * 3 + 1] = y;
       positions[i * 3 + 2] = Math.sin(angle) * radius;
       sizes[i] = size;
       mixes[i] = mix;
-      phases[i] = phase;
     }
 
     const particleGeo = new THREE.BufferGeometry();
     particleGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     particleGeo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
     particleGeo.setAttribute('aMix', new THREE.BufferAttribute(mixes, 1));
-    particleGeo.setAttribute('aPhase', new THREE.BufferAttribute(phases, 1));
 
     const particleMat = new THREE.ShaderMaterial({
       uniforms: {
@@ -132,12 +123,9 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
       vertexShader: /* glsl */ `
         attribute float aSize;
         attribute float aMix;
-        attribute float aPhase;
         varying float vMix;
-        varying float vPhase;
         void main() {
           vMix = aMix;
-          vPhase = aPhase;
           vec4 mv = modelViewMatrix * vec4(position, 1.0);
           gl_PointSize = aSize * uPixelRatio * (300.0 / -mv.z);
           gl_Position = projectionMatrix * mv;
@@ -148,14 +136,13 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
         uniform vec3 uCoreColor;
         uniform float uOpacity;
         varying float vMix;
-        varying float vPhase;
         void main() {
           vec2 uv = gl_PointCoord - vec2(0.5);
           float d = length(uv) * 2.0;
           if (d > 1.0) discard;
           float glow = pow(1.0 - d, 2.0);
           vec3 color = mix(uEdgeColor, uCoreColor, vMix);
-          float intensity = 0.7 + vMix * 1.0;
+          float intensity = 0.75 + vMix * 0.9;
           gl_FragColor = vec4(color * intensity, glow * uOpacity);
         }
       `,
@@ -167,24 +154,12 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     const particleSystem = new THREE.Points(particleGeo, particleMat);
     scene.add(particleSystem);
 
-    // ---- Central glowing core ----
-    const coreGeo = new THREE.IcosahedronGeometry(0.4, 1);
-    const coreMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-      wireframe: true,
-      transparent: true,
-      opacity: 0.4,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    });
-    const coreMesh = new THREE.Mesh(coreGeo, coreMat);
-    scene.add(coreMesh);
-
-    const hotGeo = new THREE.IcosahedronGeometry(0.14, 0);
+    // Central bright core.
+    const hotGeo = new THREE.IcosahedronGeometry(0.22, 1);
     const hotMat = new THREE.MeshBasicMaterial({
       color: 0xffffff,
       transparent: true,
-      opacity: 0.45,
+      opacity: 0.5,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
     });
@@ -197,9 +172,6 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     let elapsed = 0;
 
     const renderOnce = () => {
-      particleSystem.rotation.set(0, 0.5, 0);
-      coreMesh.rotation.set(0.3, 0.4, 0);
-      coreMesh.scale.setScalar(1.1);
       renderer.render(scene, camera);
     };
 
@@ -209,49 +181,28 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
       elapsed += dt;
 
       const clamp = Math.max(0, Math.min(100, intensity));
-      const speed = state.speed * (1 + (clamp / 100) * 1.6);
+      const speed = state.speed * (1 + (clamp / 100) * 1.4);
 
       const pos = particleGeo.getAttribute('position') as THREE.BufferAttribute;
-      const mixAttr = particleGeo.getAttribute('aMix') as THREE.BufferAttribute;
 
       for (let i = 0; i < PARTICLE_COUNT; i++) {
-        const p = particles[i];
-        // Angular velocity rises near the core — real vortex shear.
-        p.angle += (p.angularBase / Math.pow(p.radius, 0.62)) * dt * speed;
-        // Accretion: spiral inward, then recycle to the outer rim.
-        p.radius -= 0.4 * dt * speed * (0.35 + p.mix);
-        if (p.radius < 0.3) {
-          p.radius = 5.4 + Math.random() * 0.8;
-          p.angle = Math.random() * Math.PI * 2;
-        }
-        // Vertical undulation tied to orbit — gives the vortex 3D billow.
-        p.y += Math.sin(elapsed * 1.4 + p.phase * 6.28318 + p.angle) * 0.006 * speed;
-        p.y *= 0.998;
-
-        const x = Math.cos(p.angle) * p.radius;
-        const z = Math.sin(p.angle) * p.radius;
-        pos.setXYZ(i, x, p.y, z);
-
-        const newMix = Math.max(0, Math.min(1, 1 - (p.radius - 0.3) / 6.1));
-        p.mix = newMix;
-        mixAttr.setX(i, newMix);
+        const s = stars[i];
+        // Differential rotation: each star orbits at its own angular speed.
+        s.angle += s.omega * dt * speed;
+        const x = Math.cos(s.angle) * s.radius;
+        const z = Math.sin(s.angle) * s.radius;
+        pos.setXYZ(i, x, s.y, z);
       }
       pos.needsUpdate = true;
-      mixAttr.needsUpdate = true;
 
-      particleSystem.rotation.y += dt * 0.06;
+      // Core pulse.
+      hotMesh.scale.setScalar(1 + (clamp / 100) * 0.5 + Math.sin(elapsed * 4.0) * 0.12);
+      hotMesh.rotation.x += dt * 0.5;
+      hotMesh.rotation.y += dt * 0.8;
 
-      // Core pulse scales with intensity.
-      const pulse = 1 + Math.sin(elapsed * 3.2) * 0.15 + (clamp / 100) * 0.25;
-      coreMesh.scale.setScalar(pulse);
-      hotMesh.scale.setScalar(1 + (clamp / 100) * 0.6 + Math.sin(elapsed * 6.0) * 0.1);
-      coreMesh.rotation.x += dt * 0.6;
-      coreMesh.rotation.y += dt * 0.9;
-
-      // Gentle camera sway.
-      camera.position.x = Math.sin(elapsed * 0.15) * 0.6;
-      camera.position.y = 4.4 + Math.sin(elapsed * 0.2) * 0.4;
-      camera.lookAt(0, -0.2, 0);
+      // Slow cinematic sway.
+      camera.position.x = Math.sin(elapsed * 0.12) * 1.2;
+      camera.lookAt(0, 0, 0);
 
       renderer.render(scene, camera);
     };
@@ -323,8 +274,6 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
       if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
       particleGeo.dispose();
       particleMat.dispose();
-      coreGeo.dispose();
-      coreMat.dispose();
       hotGeo.dispose();
       hotMat.dispose();
       renderer.dispose();
