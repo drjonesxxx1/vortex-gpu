@@ -1,8 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 
 type CanvasState = 'off' | 'booting' | 'running' | 'stopping' | 'suspended';
 
@@ -17,11 +14,11 @@ interface CyberCanvasProps {
 
 // State-driven palette: edge colour, white-hot core colour, base spin speed, particle opacity.
 const COLORS: Record<CanvasState, { edge: number; core: number; speed: number; opacity: number }> = {
-  running:   { edge: 0x22d3ee, core: 0xffffff, speed: 1.0,  opacity: 0.8 },
-  booting:   { edge: 0xfbbf24, core: 0xfff7e0, speed: 0.55, opacity: 0.7 },
-  stopping:  { edge: 0xfbbf24, core: 0xffe0c0, speed: 0.3,  opacity: 0.55 },
-  suspended: { edge: 0x64748b, core: 0xcbd5e1, speed: 0.18, opacity: 0.45 },
-  off:       { edge: 0x445566, core: 0x8899aa, speed: 0.08, opacity: 0.35 },
+  running:   { edge: 0x22d3ee, core: 0xffffff, speed: 1.0,  opacity: 0.85 },
+  booting:   { edge: 0xfbbf24, core: 0xfff7e0, speed: 0.55, opacity: 0.75 },
+  stopping:  { edge: 0xfbbf24, core: 0xffe0c0, speed: 0.3,  opacity: 0.6 },
+  suspended: { edge: 0x64748b, core: 0xcbd5e1, speed: 0.18, opacity: 0.5 },
+  off:       { edge: 0x445566, core: 0x8899aa, speed: 0.08, opacity: 0.4 },
 };
 
 const PARTICLE_COUNT = 9000;
@@ -47,7 +44,7 @@ function prefersReducedMotion(): boolean {
 /**
  * Decorative WebGL centrepiece for the hero.
  *
- * Accessibility / performance contract (preserved from the previous build):
+ * Accessibility / performance contract:
  *  - aria-hidden: it carries no information a screen reader needs.
  *  - prefers-reduced-motion: renders exactly one still frame, no rAF loop.
  *  - pauses entirely while the tab is hidden or the element is off-screen.
@@ -80,24 +77,16 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     const height = container.clientHeight || 320;
 
     const scene = new THREE.Scene();
+    // Elevated camera so the spiral disc reads clearly, not edge-on.
     const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 1000);
-    camera.position.set(0, 2.2, 7.5);
-    camera.lookAt(0, 0, 0);
+    camera.position.set(0, 4.4, 7.5);
+    camera.lookAt(0, -0.2, 0);
 
     renderer.setSize(width, height);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setClearColor(0x000000, 0);
     renderer.domElement.setAttribute('aria-hidden', 'true');
     container.appendChild(renderer.domElement);
-
-    // Post-processing bloom for the glow.
-    const composer = new EffectComposer(renderer);
-    composer.addPass(new RenderPass(scene, camera));
-    const bloom = new UnrealBloomPass(new THREE.Vector2(width, height), 0.8, 0.5, 0.55);
-    bloom.threshold = 0.3;
-    bloom.strength = 0.6;
-    bloom.radius = 0.5;
-    composer.addPass(bloom);
 
     const state = COLORS[vmState] ?? COLORS.off;
 
@@ -109,14 +98,14 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     const phases = new Float32Array(PARTICLE_COUNT);
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
-      // Bias radius toward the core so the vortex reads dense and energetic.
-      const radius = 0.35 + Math.pow(Math.random(), 0.55) * 6.4;
+      // Bias radius toward the core so the vortex is dense and bright in the middle.
+      const radius = 0.3 + Math.pow(Math.random(), 1.35) * 6.0;
       const angle = Math.random() * Math.PI * 2;
-      const y = (Math.random() - 0.5) * 3.2;
+      const y = (Math.random() - 0.5) * 2.4;
       const angularBase = 0.5 + Math.random() * 0.6;
-      const size = 0.04 + Math.random() * 0.09;
+      const size = 0.03 + Math.random() * 0.08;
       const phase = Math.random();
-      const mix = Math.max(0, Math.min(1, 1 - (radius - 0.35) / 6.4));
+      const mix = Math.max(0, Math.min(1, 1 - (radius - 0.3) / 6.0));
 
       particles.push({ radius, angle, y, angularBase, size, phase, mix });
       positions[i * 3] = Math.cos(angle) * radius;
@@ -165,10 +154,9 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
           float d = length(uv) * 2.0;
           if (d > 1.0) discard;
           float glow = pow(1.0 - d, 2.0);
-          float twinkle = 0.85 + 0.15 * sin(vPhase * 6.28318);
           vec3 color = mix(uEdgeColor, uCoreColor, vMix);
-          float intensity = 0.8 + vMix * 1.0;
-          gl_FragColor = vec4(color * intensity, glow * uOpacity * twinkle);
+          float intensity = 0.7 + vMix * 1.0;
+          gl_FragColor = vec4(color * intensity, glow * uOpacity);
         }
       `,
       transparent: true,
@@ -180,23 +168,23 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     scene.add(particleSystem);
 
     // ---- Central glowing core ----
-    const coreGeo = new THREE.IcosahedronGeometry(0.42, 1);
+    const coreGeo = new THREE.IcosahedronGeometry(0.4, 1);
     const coreMat = new THREE.MeshBasicMaterial({
       color: 0xffffff,
       wireframe: true,
       transparent: true,
-      opacity: 0.45,
+      opacity: 0.4,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
     });
     const coreMesh = new THREE.Mesh(coreGeo, coreMat);
     scene.add(coreMesh);
 
-    const hotGeo = new THREE.IcosahedronGeometry(0.16, 0);
+    const hotGeo = new THREE.IcosahedronGeometry(0.14, 0);
     const hotMat = new THREE.MeshBasicMaterial({
       color: 0xffffff,
       transparent: true,
-      opacity: 0.5,
+      opacity: 0.45,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
     });
@@ -209,11 +197,10 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     let elapsed = 0;
 
     const renderOnce = () => {
-      // Pleasant off-axis still pose for reduced-motion / paused states.
-      particleSystem.rotation.set(0, 0.6, 0);
+      particleSystem.rotation.set(0, 0.5, 0);
       coreMesh.rotation.set(0.3, 0.4, 0);
       coreMesh.scale.setScalar(1.1);
-      composer.render();
+      renderer.render(scene, camera);
     };
 
     const animate = () => {
@@ -232,9 +219,9 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
         // Angular velocity rises near the core — real vortex shear.
         p.angle += (p.angularBase / Math.pow(p.radius, 0.62)) * dt * speed;
         // Accretion: spiral inward, then recycle to the outer rim.
-        p.radius -= 0.35 * dt * speed * (0.4 + p.mix);
-        if (p.radius < 0.32) {
-          p.radius = 5.6 + Math.random() * 0.9;
+        p.radius -= 0.4 * dt * speed * (0.35 + p.mix);
+        if (p.radius < 0.3) {
+          p.radius = 5.4 + Math.random() * 0.8;
           p.angle = Math.random() * Math.PI * 2;
         }
         // Vertical undulation tied to orbit — gives the vortex 3D billow.
@@ -245,35 +232,34 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
         const z = Math.sin(p.angle) * p.radius;
         pos.setXYZ(i, x, p.y, z);
 
-        const newMix = Math.max(0, Math.min(1, 1 - (p.radius - 0.32) / 6.3));
+        const newMix = Math.max(0, Math.min(1, 1 - (p.radius - 0.3) / 6.1));
         p.mix = newMix;
         mixAttr.setX(i, newMix);
       }
       pos.needsUpdate = true;
       mixAttr.needsUpdate = true;
 
-      particleSystem.rotation.y += dt * 0.08;
+      particleSystem.rotation.y += dt * 0.06;
 
       // Core pulse scales with intensity.
-      const pulse = 1 + Math.sin(elapsed * 3.2) * 0.18 + (clamp / 100) * 0.3;
+      const pulse = 1 + Math.sin(elapsed * 3.2) * 0.15 + (clamp / 100) * 0.25;
       coreMesh.scale.setScalar(pulse);
-      hotMesh.scale.setScalar(1 + (clamp / 100) * 0.8 + Math.sin(elapsed * 6.0) * 0.12);
+      hotMesh.scale.setScalar(1 + (clamp / 100) * 0.6 + Math.sin(elapsed * 6.0) * 0.1);
       coreMesh.rotation.x += dt * 0.6;
       coreMesh.rotation.y += dt * 0.9;
-      coreMat.opacity = 0.35 + (state.opacity * 0.3);
 
-      // Cinematic camera drift.
-      camera.position.x = Math.sin(elapsed * 0.15) * 0.5;
-      camera.position.y = 2.2 + Math.sin(elapsed * 0.2) * 0.3;
-      camera.lookAt(0, 0, 0);
+      // Gentle camera sway.
+      camera.position.x = Math.sin(elapsed * 0.15) * 0.6;
+      camera.position.y = 4.4 + Math.sin(elapsed * 0.2) * 0.4;
+      camera.lookAt(0, -0.2, 0);
 
-      composer.render();
+      renderer.render(scene, camera);
     };
 
     const start = () => {
       if (running || still) return;
       running = true;
-      clock.getDelta(); // discard the gap accumulated while paused
+      clock.getDelta();
       animate();
     };
     const stop = () => {
@@ -285,7 +271,6 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     renderOnce();
     let onScreen = true;
 
-    // Only burn GPU cycles while the hero is actually visible.
     let observer: IntersectionObserver | null = null;
     if (typeof IntersectionObserver !== 'undefined') {
       observer = new IntersectionObserver(
@@ -314,12 +299,10 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
-      composer.setSize(w, h);
       if (!running) renderOnce();
     };
     window.addEventListener('resize', handleResize);
 
-    // React live to the user toggling reduced motion at the OS level.
     const mq = window.matchMedia?.('(prefers-reduced-motion: reduce)');
     const onMotionChange = () => {
       if (mq?.matches) {
@@ -344,8 +327,6 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
       coreMat.dispose();
       hotGeo.dispose();
       hotMat.dispose();
-      bloom.dispose();
-      composer.dispose();
       renderer.dispose();
     };
   }, [vmState, intensity]);
