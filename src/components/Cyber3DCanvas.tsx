@@ -13,24 +13,18 @@ interface CyberCanvasProps {
 }
 
 const COLORS: Record<CanvasState, { edge: number; core: number; speed: number; opacity: number }> = {
-  running:   { edge: 0x22d3ee, core: 0xffffff, speed: 1.0,  opacity: 0.9 },
-  booting:   { edge: 0xfbbf24, core: 0xfff7e0, speed: 0.55, opacity: 0.8 },
-  stopping:  { edge: 0xfbbf24, core: 0xffe0c0, speed: 0.3,  opacity: 0.65 },
-  suspended: { edge: 0x64748b, core: 0xcbd5e1, speed: 0.18, opacity: 0.55 },
-  off:       { edge: 0x445566, core: 0x8899aa, speed: 0.08, opacity: 0.45 },
+  running:   { edge: 0x22d3ee, core: 0xffffff, speed: 1.0,  opacity: 0.95 },
+  booting:   { edge: 0xfbbf24, core: 0xfff7e0, speed: 0.5,  opacity: 0.85 },
+  stopping:  { edge: 0xfbbf24, core: 0xffe0c0, speed: 0.28, opacity: 0.7 },
+  suspended: { edge: 0x64748b, core: 0xcbd5e1, speed: 0.15, opacity: 0.6 },
+  off:       { edge: 0x445566, core: 0x8899aa, speed: 0.06, opacity: 0.5 },
 };
 
-const PARTICLE_COUNT = 9000;
-const ARM_COUNT = 3;
-const TWIST = 1.35;
-const MAX_RADIUS = 6.2;
-
-interface Star {
-  radius: number;
-  angle: number;
-  y: number;
-  omega: number;
-}
+const ARM_COUNT = 4;
+const TWIST = 1.6;          // how tightly the arms wind (radians per unit radius)
+const MAX_RADIUS = 6.0;
+const POINTS_PER_ARM = 1600;
+const PARTICLE_COUNT = ARM_COUNT * POINTS_PER_ARM;
 
 function prefersReducedMotion(): boolean {
   return (
@@ -40,7 +34,6 @@ function prefersReducedMotion(): boolean {
   );
 }
 
-/** Soft radial-gradient sprite so particles render smooth, not aliased/sparkly. */
 function makeSprite(): THREE.Texture {
   const size = 64;
   const canvas = document.createElement('canvas');
@@ -50,8 +43,8 @@ function makeSprite(): THREE.Texture {
   if (ctx) {
     const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
     g.addColorStop(0, 'rgba(255,255,255,1)');
-    g.addColorStop(0.3, 'rgba(255,255,255,0.9)');
-    g.addColorStop(0.6, 'rgba(255,255,255,0.35)');
+    g.addColorStop(0.35, 'rgba(255,255,255,0.85)');
+    g.addColorStop(0.65, 'rgba(255,255,255,0.3)');
     g.addColorStop(1, 'rgba(255,255,255,0)');
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, size, size);
@@ -88,8 +81,9 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     const height = container.clientHeight || 320;
 
     const scene = new THREE.Scene();
+    // Fixed elevated camera — no sway, so it reads calm and ordered.
     const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 1000);
-    camera.position.set(0, 8.2, 3.6);
+    camera.position.set(0, 8.5, 3.2);
     camera.lookAt(0, 0, 0);
 
     renderer.setSize(width, height);
@@ -101,31 +95,32 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     const state = COLORS[vmState] ?? COLORS.off;
     const sprite = makeSprite();
 
-    // ---- Spiral-galaxy particle field ----
-    const stars: Star[] = [];
+    // ---- Deterministic spiral — no scatter, no random sizes, perfectly uniform ----
     const positions = new Float32Array(PARTICLE_COUNT * 3);
     const colors = new Float32Array(PARTICLE_COUNT * 3);
     const edgeColor = new THREE.Color(state.edge);
     const coreColor = new THREE.Color(state.core);
 
-    for (let i = 0; i < PARTICLE_COUNT; i++) {
-      const arm = i % ARM_COUNT;
+    let i = 0;
+    for (let arm = 0; arm < ARM_COUNT; arm++) {
       const armOffset = (arm / ARM_COUNT) * Math.PI * 2;
-      const radius = 0.5 + Math.pow(Math.random(), 0.7) * (MAX_RADIUS - 0.5);
-      const angle = armOffset + radius * TWIST + (Math.random() - 0.5) * 0.7;
-      const y = (Math.random() - 0.5) * 1.1;
-      const omega = 1.1 / Math.pow(radius, 0.55);
-      const mix = Math.max(0, Math.min(1, 1 - (radius - 0.5) / (MAX_RADIUS - 0.5)));
+      for (let j = 0; j < POINTS_PER_ARM; j++) {
+        const t = j / (POINTS_PER_ARM - 1);               // 0..1, evenly spaced
+        const radius = 0.4 + t * (MAX_RADIUS - 0.4);
+        const angle = armOffset + radius * TWIST;          // logarithmic spiral, no scatter
+        const y = 0;                                        // perfectly flat
+        const mix = 1 - t;                                  // bright centre → colour edge
 
-      stars.push({ radius, angle, y, omega });
-      positions[i * 3] = Math.cos(angle) * radius;
-      positions[i * 3 + 1] = y;
-      positions[i * 3 + 2] = Math.sin(angle) * radius;
+        positions[i * 3] = Math.cos(angle) * radius;
+        positions[i * 3 + 1] = y;
+        positions[i * 3 + 2] = Math.sin(angle) * radius;
 
-      const c = edgeColor.clone().lerp(coreColor, mix);
-      colors[i * 3] = c.r;
-      colors[i * 3 + 1] = c.g;
-      colors[i * 3 + 2] = c.b;
+        const c = edgeColor.clone().lerp(coreColor, mix);
+        colors[i * 3] = c.r;
+        colors[i * 3 + 1] = c.g;
+        colors[i * 3 + 2] = c.b;
+        i++;
+      }
     }
 
     const particleGeo = new THREE.BufferGeometry();
@@ -133,7 +128,7 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     particleGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 
     const particleMat = new THREE.PointsMaterial({
-      size: 0.22,
+      size: 0.2,
       map: sprite,
       vertexColors: true,
       transparent: true,
@@ -147,11 +142,11 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
     scene.add(particleSystem);
 
     // Central bright core.
-    const hotGeo = new THREE.IcosahedronGeometry(0.24, 1);
+    const hotGeo = new THREE.IcosahedronGeometry(0.28, 2);
     const hotMat = new THREE.MeshBasicMaterial({
       color: 0xffffff,
       transparent: true,
-      opacity: 0.5,
+      opacity: 0.55,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
     });
@@ -173,23 +168,12 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
       elapsed += dt;
 
       const clamp = Math.max(0, Math.min(100, intensity));
-      const speed = state.speed * (1 + (clamp / 100) * 1.4);
+      // Slow, rigid, uniform rotation — the whole spiral turns as one ordered unit.
+      const rotSpeed = (0.25 + (clamp / 100) * 0.5) * state.speed;
+      particleSystem.rotation.y += rotSpeed * dt;
 
-      const pos = particleGeo.getAttribute('position') as THREE.BufferAttribute;
-
-      for (let i = 0; i < PARTICLE_COUNT; i++) {
-        const s = stars[i];
-        s.angle += s.omega * dt * speed;
-        pos.setXYZ(i, Math.cos(s.angle) * s.radius, s.y, Math.sin(s.angle) * s.radius);
-      }
-      pos.needsUpdate = true;
-
-      hotMesh.scale.setScalar(1 + (clamp / 100) * 0.5 + Math.sin(elapsed * 4.0) * 0.12);
-      hotMesh.rotation.x += dt * 0.5;
-      hotMesh.rotation.y += dt * 0.8;
-
-      camera.position.x = Math.sin(elapsed * 0.12) * 1.2;
-      camera.lookAt(0, 0, 0);
+      // Gentle core pulse.
+      hotMesh.scale.setScalar(1 + Math.sin(elapsed * 2.0) * 0.08);
 
       renderer.render(scene, camera);
     };
