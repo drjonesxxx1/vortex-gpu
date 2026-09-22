@@ -23,6 +23,10 @@ const COLORS: Record<CanvasState, { edge: number; core: number; speed: number; o
 const ARM_COUNT = 4;
 const TWIST = 1.6;          // how tightly the arms wind (radians per unit radius)
 const MAX_RADIUS = 6.0;
+// Gentle funnel: the arms curve DOWN toward the centre so the whole thing reads
+// as a vortex throat, not a flat disc — shallow on purpose, a deep one reads as
+// the cylinder we deliberately moved away from.
+const FUNNEL_DEPTH = 1.5;
 const POINTS_PER_ARM = 1600;
 const PARTICLE_COUNT = ARM_COUNT * POINTS_PER_ARM;
 
@@ -108,7 +112,8 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
         const t = j / (POINTS_PER_ARM - 1);               // 0..1, evenly spaced
         const radius = 0.4 + t * (MAX_RADIUS - 0.4);
         const angle = armOffset + radius * TWIST;          // logarithmic spiral, no scatter
-        const y = 0;                                        // perfectly flat
+        // Funnel: centre (t→0) pulled down into the throat, rim (t→1) at 0.
+        const y = -FUNNEL_DEPTH * Math.pow(1 - t, 1.6);
         const mix = 1 - t;                                  // bright centre → colour edge
 
         positions[i * 3] = Math.cos(angle) * radius;
@@ -151,6 +156,8 @@ export const Cyber3DCanvas: React.FC<CyberCanvasProps> = ({
       depthWrite: false,
     });
     const hotMesh = new THREE.Mesh(hotGeo, hotMat);
+    // Sit the bright core at the bottom of the funnel throat, not floating above it.
+    hotMesh.position.y = -FUNNEL_DEPTH;
     scene.add(hotMesh);
 
     const clock = new THREE.Clock();
