@@ -116,11 +116,14 @@ interface Tier {
   os?: "windows" | "linux";
   protocol?: "rdp" | "ssh";
   username?: string;    // default tenant login for the guest
+  node?: string;        // GPU tier: which registered node serves it (defaults to SESSION_NODE)
+  gpuSku?: string;      // GPU tier: marketing SKU string (decoupled from truth)
 }
 const CATALOG: Tier[] = [
   { key: "ubuntu-ct", label: "Ubuntu (headless CT)", priceUsdPerHour: num(process.env.PRICE_UBUNTU_CT, 1), kind: "pct", template: PVE_TEMPLATE_CT, os: "linux", protocol: "ssh", username: "rent" },
   { key: "linux-vm", label: "Ubuntu Linux VM", priceUsdPerHour: num(process.env.PRICE_LINUX_VM, 2), kind: "qm", template: PVE_TEMPLATE_LINUX, os: "linux", protocol: "ssh", username: "rent" },
-  { key: "gpu", label: "GPU Session", priceUsdPerHour: num(process.env.PRICE_GPU, 5), kind: "gpu" },
+  { key: "gpu", label: "GPU Session", priceUsdPerHour: num(process.env.PRICE_GPU, 5), kind: "gpu", gpuSku: "NVIDIA GeForce RTX 4080 SUPER 16GB" },
+  { key: "gpu-quadro", label: "GPU Session (Workstation)", priceUsdPerHour: num(process.env.PRICE_GPU_QUADRO, 3), kind: "gpu", node: "pve", gpuSku: "NVIDIA Quadro M4000 8GB Workstation GPU" },
   { key: "win11", label: "Windows 11", priceUsdPerHour: num(process.env.PRICE_WIN11, 10), kind: "qm", template: PVE_TEMPLATE_WIN11, os: "windows", protocol: "rdp", username: "administrator" },
   { key: "comando", label: "Comando VM", priceUsdPerHour: num(process.env.PRICE_COMANDO, 20), kind: "qm", template: PVE_TEMPLATE_COMANDO, os: "windows", protocol: "rdp", username: "administrator" },
 ];
@@ -2123,8 +2126,10 @@ async function startServer() {
     const freeDeniedSess = freeMachineDenial(req, user);
     if (freeDeniedSess) return res.status(402).json({ error: freeDeniedSess });
 
-    // Target the Linux GPU node (nightmare) that runs the Ubuntu-session agent.
-    const hostname = SESSION_NODE;
+    // Target the Linux GPU node that runs the Ubuntu-session agent. The tier
+    // picks the GPU node: "gpu" -> nightmare (4080), "gpu-quadro" -> pve (M4000).
+    const gpuTier = TIERS[str(req.body?.tier, "gpu")] || TIERS["gpu"];
+    const hostname = gpuTier.node || SESSION_NODE;
     const node = nodes[hostname];
     if (!node || Date.now() - node.lastSeen > 30_000) {
       return res.status(503).json({ error: "GPU node offline — try again shortly" });
@@ -2136,9 +2141,8 @@ async function startServer() {
     const instanceId = "sess_" + crypto.randomBytes(16).toString("hex");
     const password = "Ub" + crypto.randomBytes(6).toString("hex") + "!";
     const id = "ses_" + crypto.randomBytes(8).toString("hex");
-    // Every session is the GPU tier; lock its tier and price onto the row so the
-    // sweep bills it at the GPU rate (not the flat $1/hr it used to assume).
-    const gpuTier = TIERS["gpu"];
+    // Lock the tier and price onto the row so the sweep bills it at the tier
+    // rate (not the flat $1/hr it used to assume).
 
     // Dispatch a live session RIGHT NOW (port + clean proxy + provision job) and
     // respond 200. Used when the card is available (arbitrator) or when the VRAM

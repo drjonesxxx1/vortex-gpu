@@ -343,7 +343,7 @@ function Dashboard({
    *  The busy key is the tier id, so each card spins independently. */
   const deployTier = (card: TierCard) => {
     if (card.provision === 'session') {
-      run(card.tier, '/api/session/spawn', { resolution: '1440x900' }, 'Could not start session');
+      run(card.tier, '/api/session/spawn', { resolution: '1440x900', tier: card.tier }, 'Could not start session');
     } else {
       run(card.tier, '/api/vms/provision', { tier: card.tier }, `Could not deploy ${card.label}`);
     }

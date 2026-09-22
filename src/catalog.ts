@@ -79,6 +79,14 @@ const PRESENTATION: Record<string, Presentation> = {
     blurb:
       'A full Ubuntu desktop streamed to your browser over noVNC, with an RTX 4080 attached. The card is shared, so check the VRAM headroom above before a heavy run.',
   },
+  'gpu-quadro': {
+    accent: 'emerald',
+    iconKey: 'terminal',
+    connectVia: 'In-browser',
+    gpuAttached: true,
+    blurb:
+      'A full Ubuntu desktop streamed to your browser over noVNC, with a workstation-grade NVIDIA Quadro M4000 (8GB) attached. Professional GPU for CAD, creative and compute workloads.',
+  },
   win11: {
     accent: 'cyan',
     iconKey: 'laptop',
@@ -103,6 +111,7 @@ export const FALLBACK_CATALOG: CatalogEntry[] = [
   { tier: 'ubuntu-ct', label: 'Ubuntu (headless CT)', priceUsdPerHour: 1, kind: 'pct' },
   { tier: 'linux-vm', label: 'Ubuntu Linux VM', priceUsdPerHour: 2, kind: 'qm' },
   { tier: 'gpu', label: 'GPU Session', priceUsdPerHour: 5, kind: 'gpu' },
+  { tier: 'gpu-quadro', label: 'GPU Session (Workstation)', priceUsdPerHour: 3, kind: 'gpu' },
   { tier: 'win11', label: 'Windows 11', priceUsdPerHour: 10, kind: 'qm' },
   { tier: 'comando', label: 'Comando VM', priceUsdPerHour: 20, kind: 'qm' },
 ];

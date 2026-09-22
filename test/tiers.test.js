@@ -56,7 +56,7 @@ describe("catalog: /api/health exposes the five tiers with prices", () => {
     const byTier = Object.fromEntries(r.json.catalog.map((t) => [t.tier, t]));
     assert.deepEqual(
       r.json.catalog.map((t) => t.tier),
-      ["ubuntu-ct", "linux-vm", "gpu", "win11", "comando"],
+      ["ubuntu-ct", "linux-vm", "gpu", "gpu-quadro", "win11", "comando"],
     );
     for (const t of r.json.catalog) {
       assert.equal(typeof t.label, "string");
@@ -67,6 +67,8 @@ describe("catalog: /api/health exposes the five tiers with prices", () => {
     assert.equal(byTier["ubuntu-ct"].priceUsdPerHour, 1);
     assert.equal(byTier["linux-vm"].priceUsdPerHour, 2);
     assert.equal(byTier["gpu"].priceUsdPerHour, 5);
+    assert.equal(byTier["gpu-quadro"].priceUsdPerHour, 3);
+    assert.equal(byTier["gpu-quadro"].kind, "gpu");
     assert.equal(byTier["win11"].priceUsdPerHour, 10);
     assert.equal(byTier["comando"].priceUsdPerHour, 20);
     // Mechanism per tier.
