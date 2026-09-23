@@ -51,8 +51,8 @@ export function seedUser(ctx, opts = {}) {
   const passwordHash = "passwordHash" in opts ? opts.passwordHash : hashPassword(password);
   withDb(ctx, (db) => {
     db.prepare(
-      "INSERT INTO users (id,username,balance_minutes,btc_address,created_at,password_hash,unlimited) VALUES (?,?,?,?,?,?,?)",
-    ).run(id, username, opts.balanceMinutes ?? 0, opts.btcAddress ?? ("bc1q" + crypto.randomBytes(16).toString("hex")),
+      "INSERT INTO users (id,username,balance_minutes,free_minutes,btc_address,created_at,password_hash,unlimited) VALUES (?,?,?,?,?,?,?,?)",
+    ).run(id, username, opts.balanceMinutes ?? 0, opts.freeMinutes ?? 60, opts.btcAddress ?? ("bc1q" + crypto.randomBytes(16).toString("hex")),
       opts.createdAt ?? Date.now(), passwordHash, opts.unlimited ? 1 : 0);
   });
   return { id, username, password, passwordHash };

@@ -208,34 +208,52 @@ describe("billing: each machine is charged at ITS tier's price", () => {
 
   it("bills the billable machine's own rate, not a flat $1/hr", async () => {
     const start = 100_000;
-    const u = seedUser(srv, { balanceMinutes: start });
-    // Oldest is spared (free machine); the billable one is a $20/hr comando.
-    seedTierVm(srv, { userId: u.id, state: "running", tier: "ubuntu-ct", price: 1, createdAt: 1000 });
+    // freeMinutes:0 — past the free hour, so the charge hits the paid balance.
+    const u = seedUser(srv, { balanceMinutes: start, freeMinutes: 0 });
+    // Every machine is billable now (no spared free machine). One $20/hr comando.
     seedTierVm(srv, { userId: u.id, state: "running", tier: "comando", price: 20, createdAt: 2000 });
     const drop = await firstDrop(u.id, start);
-    // Per-tier: one billable $20/hr machine -> 20 per tick. Flat $1/hr would be 1.
+    // Per-tier: a $20/hr machine -> 20 per tick. Flat $1/hr would be 1.
     assert.equal(drop % 20, 0, `expected a multiple of 20, got ${drop}`);
     assert.ok(drop >= 20);
   });
 
-  it("first-machine-free spares the OLDEST across mixed tiers", async () => {
+  it("bills EVERY live machine (no machine is spared) at its own rate", async () => {
     const start = 100_000;
-    const u = seedUser(srv, { balanceMinutes: start });
-    // Oldest is the EXPENSIVE comando -> it must be the one spared. The newer,
-    // cheap linux-vm ($2/hr) is the only billable machine.
+    const u = seedUser(srv, { balanceMinutes: start, freeMinutes: 0 });
+    // The free tier is a time pool, not a spared machine — both are billed.
     seedTierVm(srv, { userId: u.id, state: "running", tier: "comando", price: 20, createdAt: 1000 });
     seedTierVm(srv, { userId: u.id, state: "running", tier: "linux-vm", price: 2, createdAt: 2000 });
     const drop = await firstDrop(u.id, start);
-    // Correct (spare oldest comando): 2 per tick. Sparing the newest instead
-    // would bill the comando at 20 -> drop divisible by 20.
-    assert.equal(drop, 2, `expected 2 (only the $2 linux-vm billable), got ${drop}`);
+    assert.equal(drop, 22, `expected 22 ($20 comando + $2 linux-vm, both billed), got ${drop}`);
+  });
+
+  it("draws from the free hour before the paid balance", async () => {
+    // A machine burning 5/min against a 60-min free pool + paid balance: the
+    // free pool must drop first and the paid balance stay untouched until it is
+    // spent.
+    const u = seedUser(srv, { balanceMinutes: 1000, freeMinutes: 60 });
+    withDb(srv, (db) => {
+      db.prepare(
+        "INSERT INTO sessions (id,user_id,instance_id,node_hostname,node_ip,port,password,resolution,proxy,state,created_at,tier,price_usd_per_hour) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      ).run("ses_" + crypto.randomBytes(6).toString("hex"), u.id, "sess_" + crypto.randomBytes(16).toString("hex"),
+        "testnode", "127.0.0.1", 6099, "pw", "1440x900", null, "running", 2000, "gpu", 5);
+    });
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const row = getUser(srv, u.id);
+      if (row.free_minutes < 60) {
+        assert.equal(row.balance_minutes, 1000, "paid balance must not be touched while free minutes remain");
+        break;
+      }
+      if (Date.now() > deadline) throw new Error("free_minutes never decremented");
+      await new Promise((r) => setTimeout(r, 40));
+    }
   });
 
   it("a GPU session is billed at the gpu tier price ($5/hr)", async () => {
     const start = 100_000;
-    const u = seedUser(srv, { balanceMinutes: start });
-    // A spared free vm + a billable gpu session.
-    seedTierVm(srv, { userId: u.id, state: "running", tier: "ubuntu-ct", price: 1, createdAt: 1000 });
+    const u = seedUser(srv, { balanceMinutes: start, freeMinutes: 0 });
     withDb(srv, (db) => {
       db.prepare(
         "INSERT INTO sessions (id,user_id,instance_id,node_hostname,node_ip,port,password,resolution,proxy,state,created_at,tier,price_usd_per_hour) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",

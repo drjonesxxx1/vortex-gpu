@@ -158,19 +158,28 @@ describe("spawn preflight: balance and machine caps come first", () => {
   let broke, brokeToken, rich, richToken;
 
   before(async () => {
-    broke = seedUser(srv, { password: "hunter22", balanceMinutes: 0 });
+    // free hour already used up AND zero paid balance -> must be blocked.
+    broke = seedUser(srv, { password: "hunter22", balanceMinutes: 0, freeMinutes: 0 });
     brokeToken = await tokenFor(srv, broke);
     rich = seedUser(srv, { password: "hunter22", balanceMinutes: 10_000 });
     richToken = await tokenFor(srv, rich);
     assert.equal((await reportNode(srv, { memUsedMb: 1000 })).status, 200);
   });
 
-  it("402s a zero-balance account that already has its free machine", async () => {
-    seedSession(srv, { userId: broke.id, state: "running" });
+  it("402s an account with no free minutes and no paid balance", async () => {
     const r = await post(srv, "/api/session/spawn", { token: brokeToken, body: {} });
     assert.equal(r.status, 402);
-    assert.match(r.json.error, /insufficient balance/);
-    assert.equal(countSessions(srv, broke.id), 1, "no extra row");
+    assert.match(r.json.error, /free hour used up/i);
+    assert.equal(countSessions(srv, broke.id), 0, "nothing created");
+  });
+
+  it("lets a brand-new account spawn on its free hour with zero paid balance", async () => {
+    const fresh = seedUser(srv, { password: "hunter22", balanceMinutes: 0, freeMinutes: 60 });
+    const token = await tokenFor(srv, fresh);
+    const r = await post(srv, "/api/session/spawn", { token, body: {} });
+    // Not a 402 — the free hour covers it (may 200/queue/503-on-node, but never
+    // payment-blocked).
+    assert.notEqual(r.status, 402, r.text);
   });
 
   it("429s a paying account at the 3-machine cap", async () => {

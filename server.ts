@@ -170,7 +170,12 @@ const GPU_PREEMPT_WAIT_MS = Math.max(2000, num(process.env.GPU_PREEMPT_WAIT_MS, 
 // MUST agree on this, or health advertises capacity sessions cannot use.
 const SESSION_NODE = process.env.SESSION_NODE || "nightmare";
 const MAX_VMS_PER_USER = 3;
-const FREE_MACHINES = Number(process.env.FREE_MACHINES) || 1; // 1st machine free, 2nd+ billed
+const FREE_MACHINES = Number(process.env.FREE_MACHINES) || 1; // legacy; superseded by FREE_TRIAL_MINUTES
+// One-time free allowance per account, in balance-minutes ($1/hr-minutes). A new
+// account gets this many minutes of runtime free (across ALL machines/tiers,
+// billed at each tier's rate); once it and the paid balance are exhausted the
+// account's machines auto-stop. Replaces the old "first machine free forever".
+const FREE_TRIAL_MINUTES = Math.max(0, num(process.env.FREE_TRIAL_MINUTES, 60));
 // Billing tick. One tick charges each billable machine its tier's price (in
 // balance_minutes), so the default of one minute keeps the "$P/hr" contract
 // exact. TESTING ONLY: lower it to observe the sweep without waiting a minute —
@@ -388,6 +393,9 @@ function ensureColumn(table: string, col: string, ddl: string) {
 }
 ensureColumn("users", "password_hash", "password_hash TEXT");
 ensureColumn("users", "unlimited", "unlimited INTEGER NOT NULL DEFAULT 0");
+// One-time free-trial pool (balance-minutes). Existing rows get the default via
+// ADD COLUMN, so accounts that predate this each receive one free hour too.
+ensureColumn("users", "free_minutes", `free_minutes INTEGER NOT NULL DEFAULT ${FREE_TRIAL_MINUTES}`);
 ensureColumn("sessions", "proxy", "proxy TEXT");
 // Per-tier pricing: the tier key and the price (USD/hr) LOCKED in at provision
 // time. Nullable on purpose — a row that predates these columns bills at the
@@ -1679,6 +1687,7 @@ async function startServer() {
       gpuVramFreeMb: sessionNode ? Math.max(0, (sessionNode.memTotalMb || 0) - (sessionNode.memUsedMb || 0)) : 0,
       gpuVramTotalMb: sessionNode ? (sessionNode.memTotalMb || 0) : 0,
       minFreeVramMb: MIN_FREE_VRAM_MB,
+      freeTrialMinutes: FREE_TRIAL_MINUTES,
       // Counts only — never an endpoint URL and never an egress IP. This route is
       // public, and the set of addresses a tenant can egress from is exactly the
       // thing an anonymity product must not publish.
@@ -1839,10 +1848,11 @@ async function startServer() {
     // show a countdown (see /api/sessions). null when unknown, never faked.
     if (sessions.some((s) => s.state === "queued")) await attachQueueInfo(sessions);
     res.json({
-      user: { id: user.id, username: user.username, balance_minutes: user.balance_minutes, unlimited: !!user.unlimited },
+      user: { id: user.id, username: user.username, balance_minutes: user.balance_minutes, free_minutes: Math.max(0, Number(user.free_minutes) || 0), unlimited: !!user.unlimited },
       vms, sessions,
       max_machines: user.unlimited ? -1 : MAX_VMS_PER_USER,
-      free_machines: user.unlimited ? MAX_VMS_PER_USER : FREE_MACHINES,
+      free_minutes: Math.max(0, Number(user.free_minutes) || 0),
+      free_trial_minutes: FREE_TRIAL_MINUTES,
       gpu_sku: GPU_SKU, price_per_hour: PRICE_USD_PER_HOUR,
     });
   });
@@ -1852,9 +1862,9 @@ async function startServer() {
   app.get("/api/account", (req, res) => {
     const user = userFromReq(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
-    const row = one<any>("SELECT id,username,balance_minutes,unlimited,btc_address,created_at FROM users WHERE id=?", user.id);
+    const row = one<any>("SELECT id,username,balance_minutes,free_minutes,unlimited,btc_address,created_at FROM users WHERE id=?", user.id);
     if (!row) return res.status(404).json({ error: "not found" });
-    res.json({ user: { id: row.id, username: row.username, balance_minutes: row.balance_minutes, unlimited: !!row.unlimited, btc_address: row.btc_address, created_at: row.created_at } });
+    res.json({ user: { id: row.id, username: row.username, balance_minutes: row.balance_minutes, free_minutes: Math.max(0, Number(row.free_minutes) || 0), unlimited: !!row.unlimited, btc_address: row.btc_address, created_at: row.created_at } });
   });
 
   // ===== VM PROVISIONING (real KVM clone) =====
@@ -1886,7 +1896,7 @@ async function startServer() {
     if (appName && !/^[a-zA-Z0-9_. -]+$/.test(appName)) return res.status(400).json({ error: "invalid app" });
     const unlimited = !!user.unlimited;
     const active = countActive(user.id);
-    if (!unlimited && active >= FREE_MACHINES && user.balance_minutes <= 0) return res.status(402).json({ error: "insufficient balance — your first machine is free; top up with Bitcoin for more" });
+    if (!unlimited && Number(user.free_minutes) <= 0 && user.balance_minutes <= 0) return res.status(402).json({ error: "free hour used up — top up with Bitcoin to keep going" });
     if (!unlimited && active >= MAX_VMS_PER_USER) return res.status(429).json({ error: `limit reached — max ${MAX_VMS_PER_USER} machines per account` });
     const freeDenied = freeMachineDenial(req, user);
     if (freeDenied) return res.status(402).json({ error: freeDenied });
@@ -2121,7 +2131,7 @@ async function startServer() {
     // could stack unbounded queued rows past their per-account limit.
     const queuedForUser = one<{ c: number }>("SELECT COUNT(*) AS c FROM sessions WHERE user_id=? AND state='queued'", user.id)?.c || 0;
     const active = countActive(user.id) + queuedForUser;
-    if (!unlimited && active >= FREE_MACHINES && user.balance_minutes <= 0) return res.status(402).json({ error: "insufficient balance — your first machine is free; top up with Bitcoin for more" });
+    if (!unlimited && Number(user.free_minutes) <= 0 && user.balance_minutes <= 0) return res.status(402).json({ error: "free hour used up — top up with Bitcoin to keep going" });
     if (!unlimited && active >= MAX_VMS_PER_USER) return res.status(429).json({ error: `limit reached — max ${MAX_VMS_PER_USER} machines per account` });
     const freeDeniedSess = freeMachineDenial(req, user);
     if (freeDeniedSess) return res.status(402).json({ error: freeDeniedSess });
@@ -2469,24 +2479,24 @@ async function startServer() {
         const arr = perUser.get(s.user_id) ?? []; arr.push({ kind: "session", row: s, price: rowPrice(s, "gpu") }); perUser.set(s.user_id, arr);
       }
       for (const [userId, machines] of perUser) {
-        const acct = one<any>("SELECT unlimited, balance_minutes FROM users WHERE id=?", userId);
+        const acct = one<any>("SELECT unlimited, balance_minutes, free_minutes FROM users WHERE id=?", userId);
         if (!acct || acct.unlimited) continue; // unlimited accounts never bill or auto-stop
-        // Spare the oldest FREE_MACHINES across ALL tiers, then bill each of the
-        // rest at ITS tier's rate. Oldest-first keeps the free slot stable.
-        const mine = machines.sort((a, b) => Number(a.row.created_at) - Number(b.row.created_at));
-        const billableRows = mine.slice(FREE_MACHINES);
-        if (billableRows.length === 0) continue;
-        // Integer column: sum the per-machine prices and round the total.
+        // EVERY live machine is billable now — the free tier is a time pool, not
+        // a spared machine. Sum each machine's per-minute price (its tier rate).
+        const billableRows = machines;
         const charge = Math.round(billableRows.reduce((sum, m) => sum + m.price, 0));
         if (charge <= 0) continue;
-        q("UPDATE users SET balance_minutes = MAX(0, balance_minutes - ?) WHERE id=?", charge, userId);
-        const u = one<any>("SELECT balance_minutes FROM users WHERE id=?", userId);
-        if (u && u.balance_minutes <= 0) {
-          // Spare the free allowance. Stopping every machine at zero balance
-          // contradicted the "your first machine is free" promise the 402 on
-          // the provision routes makes -- a customer who ran out of credit lost
-          // the machine they were still entitled to. Oldest machines are the
-          // ones kept, so the free slot is stable rather than arbitrary.
+        // Draw from the one-time free pool FIRST, then the paid balance. Both are
+        // balance-minutes, so a $5/hr machine spends 5 of them per tick from
+        // whichever pool has them.
+        const freeHave = Math.max(0, Number(acct.free_minutes) || 0);
+        const fromFree = Math.min(freeHave, charge);
+        const fromPaid = charge - fromFree;
+        if (fromFree > 0) q("UPDATE users SET free_minutes = MAX(0, free_minutes - ?) WHERE id=?", fromFree, userId);
+        if (fromPaid > 0) q("UPDATE users SET balance_minutes = MAX(0, balance_minutes - ?) WHERE id=?", fromPaid, userId);
+        const u = one<any>("SELECT balance_minutes, free_minutes FROM users WHERE id=?", userId);
+        // Auto-stop only when BOTH the free pool and the paid balance are gone.
+        if (u && u.balance_minutes <= 0 && u.free_minutes <= 0) {
           for (const { kind, row } of billableRows) {
             if (row.state === "stopping") continue; // already on its way down
             if (kind === "vm") {
